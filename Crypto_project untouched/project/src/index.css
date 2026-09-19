@@ -1,0 +1,62 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    @apply font-sans antialiased;
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    @apply bg-gradient-to-r from-brand-400 via-brand-500 to-brand-600 bg-clip-text text-transparent;
+  }
+
+  .glow-purple {
+    box-shadow: 0 0 40px -10px rgba(124, 58, 237, 0.5);
+  }
+
+  .glow-purple-strong {
+    box-shadow: 0 0 60px -5px rgba(124, 58, 237, 0.6), 0 0 20px -5px rgba(124, 58, 237, 0.3);
+  }
+
+  .card-glow {
+    box-shadow: 0 0 0 1px rgba(124, 58, 237, 0.1), 0 8px 40px -12px rgba(124, 58, 237, 0.15);
+  }
+
+  .grid-bg {
+    background-image: linear-gradient(rgba(124, 58, 237, 0.07) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(124, 58, 237, 0.07) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  .reveal {
+    opacity: 0;
+    transform: translateY(30px);
+    transition: opacity 0.7s ease-out, transform 0.7s ease-out;
+  }
+
+  .reveal.in-view {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/* Ticker pause on hover */
+.ticker-track:hover {
+  animation-play-state: paused;
+}
