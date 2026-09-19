@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
+import { adminChatUrl, adminChatHeaders } from '@/lib/supabaseEnv';
 
 interface Conversation {
   id: string;
@@ -23,14 +24,10 @@ interface ChatMessage {
   created_at: string;
 }
 
-const EDGE_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin-chat`;
-const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-const edgeHeaders = {
-  'Content-Type': 'application/json',
-  Authorization: `Bearer ${ANON_KEY}`,
-  apikey: ANON_KEY,
-};
+// Endpoint + headers come from @/lib/supabaseEnv, which normalises
+// VITE_SUPABASE_URL (strips any trailing slash, so the URL can never become
+// `.../admin-chat//login`) and throws a message naming the missing variable
+// instead of requesting `undefined/functions/v1/admin-chat/...`.
 
 export default function AdminPanel() {
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem('admin_token'));
@@ -71,21 +68,29 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, username: string) =
     setLoading(true);
 
     try {
-      const res = await fetch(`${EDGE_URL}/login`, {
+      const res = await fetch(`${adminChatUrl()}/login`, {
         method: 'POST',
-        headers: edgeHeaders,
+        headers: adminChatHeaders(),
         body: JSON.stringify({ username, password }),
       });
-      const data = await res.json();
+      // A gateway/edge error can return HTML instead of JSON — don't let
+      // `res.json()` blow up into the generic "Network error" branch.
+      const data = await res.json().catch(() => ({} as { error?: string; token?: string; username?: string }));
 
       if (!res.ok) {
-        setError(data.error || 'Login failed');
+        setError(data.error || `Login failed (HTTP ${res.status})`);
+        return;
+      }
+      if (!data.token) {
+        setError('Login succeeded but no token was returned. The admin-chat function may need redeploying.');
         return;
       }
 
-      onLogin(data.token, data.username);
-    } catch {
-      setError('Network error. Please try again.');
+      onLogin(data.token, data.username || username);
+    } catch (err) {
+      // Surfaces the actionable config message from @/lib/supabaseEnv
+      // (e.g. "Missing VITE_SUPABASE_URL ...") instead of a generic failure.
+      setError(err instanceof Error ? err.message : 'Network error. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -195,9 +200,9 @@ function AdminDashboard({ token, username, onLogout }: { token: string; username
   // Fetch conversations
   const fetchConversations = useCallback(async () => {
     try {
-      const res = await fetch(`${EDGE_URL}/conversations`, {
+      const res = await fetch(`${adminChatUrl()}/conversations`, {
         method: 'POST',
-        headers: edgeHeaders,
+        headers: adminChatHeaders(),
         body: JSON.stringify({ token }),
       });
       const data = await res.json();
@@ -213,9 +218,9 @@ function AdminDashboard({ token, username, onLogout }: { token: string; username
   // Fetch messages for selected conversation
   const fetchMessages = useCallback(async (convId: string) => {
     try {
-      const res = await fetch(`${EDGE_URL}/messages`, {
+      const res = await fetch(`${adminChatUrl()}/messages`, {
         method: 'POST',
-        headers: edgeHeaders,
+        headers: adminChatHeaders(),
         body: JSON.stringify({ token, conversationId: convId }),
       });
       const data = await res.json();
@@ -301,9 +306,9 @@ function AdminDashboard({ token, username, onLogout }: { token: string; username
       },
     ]);
 
-    await fetch(`${EDGE_URL}/reply`, {
+    await fetch(`${adminChatUrl()}/reply`, {
       method: 'POST',
-      headers: edgeHeaders,
+      headers: adminChatHeaders(),
       body: JSON.stringify({ token, conversationId: selectedId, content }),
     });
 
@@ -313,9 +318,9 @@ function AdminDashboard({ token, username, onLogout }: { token: string; username
 
   const handleCloseConversation = async () => {
     if (!selectedId) return;
-    await fetch(`${EDGE_URL}/close`, {
+    await fetch(`${adminChatUrl()}/close`, {
       method: 'POST',
-      headers: edgeHeaders,
+      headers: adminChatHeaders(),
       body: JSON.stringify({ token, conversationId: selectedId }),
     });
     fetchConversations();
@@ -546,9 +551,9 @@ function SettingsModal({ token, onClose }: { token: string; onClose: () => void 
     setLoading(true);
 
     try {
-      const res = await fetch(`${EDGE_URL}/change-password`, {
+      const res = await fetch(`${adminChatUrl()}/change-password`, {
         method: 'POST',
-        headers: edgeHeaders,
+        headers: adminChatHeaders(),
         body: JSON.stringify({ token, currentPassword, newPassword }),
       });
       const data = await res.json();
