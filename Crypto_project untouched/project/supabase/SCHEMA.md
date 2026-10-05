@@ -77,6 +77,14 @@ helper functions `notional_units(...)` and `price_units_from_notional(...)` are 
 rounding happens; everything else is addition/subtraction of integers. Rounding is truncation toward zero,
 always in the exchange's favour on fees (documented here so the engine can implement it consistently).
 
+**Boundary rule — fractional input is rounded, not rejected.** Amount columns are `numeric(38,0)`, so
+PostgreSQL rounds a fractional value to the nearest integer unit on insert (60000.5 satoshi is stored as
+60001). The stored value is always a whole number of base units — the ledger property that matters — but a
+client that sends decimals loses the fraction silently. The API layer must therefore parse amount fields as
+**integers** (JSON strings to bigint/numeric), and the tick/step validation only ever sees integers. If loud
+rejection at the database boundary is preferred, the alternative is plain `numeric` columns with
+`CHECK (x = trunc(x))` instead of `numeric(38,0)` — an open decision, see section 7.
+
 **Display** is the frontend's job: `human = amount_units / 10^base_decimals`, formatted as a decimal
 string. API responses must return these as JSON **strings**, not numbers — a JS `number` round-trip is how
 an exchange silently loses satoshis.
@@ -212,10 +220,34 @@ the UI must never receive counterparty identity.
    migration 6 so the tables apply regardless.
 9. **Not touched:** the `dist/` bundle, the frontend, `admin-chat`, `chat_*`, `admin_users`, and the
    existing 5 migrations.
+10. **SQL detail to confirm:** fractional amounts round into `numeric(38,0)` instead of being rejected
+    (see section 2). Switching to plain `numeric` plus `CHECK (x = trunc(x))` would make the database loud
+    about decimals; it costs the typmod's clear intent. Flagged for the lead, not changed.
+11. **The verification harness is committed** under `supabase/tests/` (scratch-Postgres recipe against a
+    Supabase stub). It is not wired into CI and must never be pointed at the live project.
 
 ## 8. Verification status
 
-- Static review: done (each file read against the existing migration conventions — `IF NOT EXISTS`,
-   `DROP POLICY IF EXISTS` before `CREATE POLICY`, search_path handling, service-role-only grants).
-- Apply-verification: see the PR description for the result of applying all six files to a scratch
-  PostgreSQL instance, including the RLS denial tests and the ledger-invariant tests.
+**Applied and exercised on a scratch PostgreSQL 16.15** — nothing was deployed to Supabase.
+
+- All six files apply cleanly, in filename order, to an empty database that mimics Supabase (the
+  `anon`/`authenticated`/`service_role` roles, `auth.uid()`, the `supabase_realtime` publication, and the
+  default `GRANT ALL` on new `public` tables that makes the RLS tests meaningful).
+- They also apply cleanly **on top of the five existing chat/admin migrations** in one database, and the
+  existing behaviour is unchanged afterwards: the 5 chat policies (anon included) are still there, anon can
+  still read `chat_conversations`, `admin_users` is still seeded.
+- `supabase/tests/exchange_schema_tests.sql`: **112 assertions, 0 failures** — reference data and derived
+  precision, exact integer money math, RLS (anon denied everywhere, `authenticated` sees only its own rows,
+  no client write path), append-only enforcement through both privilege and trigger, the paper/live gate,
+  order validation, balance guards and optimistic locking.
+- `supabase/tests/exchange_ledger_invariant_tests.sql`: the four deferred-invariant violations are rejected
+  at COMMIT with the intended messages, the control transaction commits, and post-conditions hold (no orphan
+  rows, no drift, ledger sums to zero).
+- **Two schema problems were found and fixed by this exercise** (they are in the migrations as pushed):
+  1. a plain `CHECK (available_units >= 0)` on `balances` made double-entry impossible, because the system
+     counterparty account (`PAPER_FAUCET`, and later the chain wallets) has to go negative to fund a user.
+     Replaced by the `balances_before_write` trigger, which keeps the rule for user accounts.
+  2. the ledger/balance invariant was one-directional: a balance could not move without ledger rows, but
+     ledger rows could be written without moving the cache. A deferred check now rejects that too.
+- **Not verified:** application to the real Supabase project, and any behaviour of the future matching
+  engine, order-placement RPCs or edge functions — none of those are built here.
