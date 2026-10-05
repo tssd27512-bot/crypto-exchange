@@ -260,7 +260,10 @@ CREATE TABLE IF NOT EXISTS public.trades (
     price_units > 0 AND qty_units > 0 AND quote_units >= 0
     AND taker_fee_units >= 0 AND maker_fee_units >= 0
   ),
-  CONSTRAINT trades_orders_differ CHECK (taker_order_id <> maker_order_id)
+  CONSTRAINT trades_orders_differ CHECK (taker_order_id <> maker_order_id),
+  CONSTRAINT trades_fee_asset_check CHECK (
+    (taker_fee_units = 0 AND maker_fee_units = 0) OR fee_asset_id IS NOT NULL
+  )
 );
 
 CREATE INDEX IF NOT EXISTS trades_tape_idx ON public.trades (market_id, created_at DESC);

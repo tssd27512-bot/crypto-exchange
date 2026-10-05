@@ -231,6 +231,36 @@ BEGIN
       USING ERRCODE = 'check_violation';
   END IF;
 
+  -- The reverse direction of balances_match_ledger: posting to an account
+  -- without moving its cached balance is just as wrong as moving the cache
+  -- without posting. (Deferred, so the cache update may happen after the
+  -- entries inside the same transaction.)
+  SELECT b.account_id,
+         COALESCE(b.available_units, 0) + COALESCE(b.locked_units, 0) AS cached_units,
+         COALESCE(e.ledger_units, 0) AS ledger_units
+    INTO v_bad
+    FROM (
+      SELECT DISTINCT account_id
+        FROM public.ledger_entries
+       WHERE transaction_id = NEW.transaction_id
+    ) touched
+    LEFT JOIN public.balances b ON b.account_id = touched.account_id
+    LEFT JOIN (
+      SELECT account_id, sum(amount_units) AS ledger_units
+        FROM public.ledger_entries
+       GROUP BY account_id
+    ) e ON e.account_id = touched.account_id
+   WHERE b.account_id IS NULL
+      OR (COALESCE(b.available_units, 0) + COALESCE(b.locked_units, 0)) <> COALESCE(e.ledger_units, 0)
+   LIMIT 1;
+
+  IF FOUND THEN
+    RAISE EXCEPTION
+      'ledger transaction % posts to account % but the cached balance is % while the ledger sums to % — write the balances row in the same transaction',
+      NEW.transaction_id, v_bad.account_id, v_bad.cached_units, v_bad.ledger_units
+      USING ERRCODE = 'check_violation';
+  END IF;
+
   RETURN NULL;
 END;
 $$;

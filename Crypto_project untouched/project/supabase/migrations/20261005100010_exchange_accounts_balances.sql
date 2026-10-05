@@ -32,14 +32,25 @@ anywhere in this schema.
 
 Integrity / concurrency guard
 -----------------------------
-- `balances.available_units` and `locked_units` have CHECK (>= 0), so a
-  withdrawal or fill can never take a balance negative even if application code
-  is wrong.
+- `balances.available_units` / `locked_units` are guarded by the
+  `balances_before_write` trigger: a user account can never go negative, so a
+  withdrawal or fill can never take a user's available balance below zero even
+  if application code is wrong. (System accounts may go negative on
+  `available_units` — they are the counterparty side of the double entry.)
 - `balances.version` is bumped by trigger on every UPDATE and is the optimistic
   lock for writers (`UPDATE ... WHERE account_id = $1 AND version = $2`);
   pessimistic writers use `SELECT ... FOR UPDATE` on the same row. Either way the
   row is the serialisation point for one account.
 - `balances.account_id` is immutable (trigger).
+- **Balances can never go negative for a user account** (`available_units >= 0`,
+  `locked_units >= 0`), so a withdrawal or a fill can never leave a user with a
+  negative available balance even if application code is wrong. This is enforced
+  by the `balances_before_write` trigger rather than a plain CHECK because
+  *system* accounts must be able to carry a negative available balance: in
+  double entry, the counterparty of a paper faucet credit or of an external
+  deposit is the `PAPER_FAUCET` / `EXTERNAL_*` account, and enforcing
+  non-negativity on it would make it impossible to fund a user at all. System
+  accounts keep the `locked_units >= 0` rule.
 - Every change to a balance must be part of the same transaction as the
   matching ledger entries: the deferred constraint trigger added in migration 3
   (`balances_match_ledger`) aborts the commit if
@@ -117,34 +128,67 @@ CREATE TABLE IF NOT EXISTS public.balances (
   version bigint NOT NULL DEFAULT 0,
   last_entry_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT balances_available_non_negative CHECK (available_units >= 0),
-  CONSTRAINT balances_locked_non_negative CHECK (locked_units >= 0)
+  updated_at timestamptz NOT NULL DEFAULT now()
+  -- No plain CHECK (available_units >= 0) here on purpose: system accounts (the
+  -- counterparty side of the double entry) must be able to go negative. The
+  -- non-negativity rule for *user* accounts is enforced by balances_before_write.
 );
 
 COMMENT ON TABLE public.balances IS
-  'Cached projection of ledger_entries, one row per account. A change is only valid in the same transaction as the matching ledger entries (enforced by the deferrable trigger balances_match_ledger). version is the optimistic concurrency guard.';
+  'Cached projection of ledger_entries, one row per account. A change is only valid in the same transaction as the matching ledger entries (enforced by the deferrable trigger balances_match_ledger). version is the optimistic concurrency guard; user accounts can never go negative (balances_before_write trigger).';
 
--- optimistic-lock / immutability guard
-CREATE OR REPLACE FUNCTION public.balances_before_update()
+-- does this account's balance have to stay non-negative? (system = no)
+CREATE OR REPLACE FUNCTION public.account_allows_negative(p_account_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+  SELECT COALESCE((SELECT account_type = 'system' FROM public.accounts WHERE id = p_account_id), false)
+$$;
+
+-- insert/update guard: immutable account_id, optimistic version bump, and the
+-- non-negativity rule for user accounts
+CREATE OR REPLACE FUNCTION public.balances_before_write()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  v_allows_negative boolean;
 BEGIN
-  IF NEW.account_id <> OLD.account_id THEN
-    RAISE EXCEPTION 'balances.account_id is immutable (% -> %)', OLD.account_id, NEW.account_id
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.account_id <> OLD.account_id THEN
+      RAISE EXCEPTION 'balances.account_id is immutable (% -> %)', OLD.account_id, NEW.account_id
+        USING ERRCODE = 'check_violation';
+    END IF;
+    NEW.version := OLD.version + 1;
+  END IF;
+
+  NEW.updated_at := now();
+  v_allows_negative := public.account_allows_negative(NEW.account_id);
+
+  IF NEW.locked_units < 0 THEN
+    RAISE EXCEPTION 'locked balance on account % cannot be negative (%)', NEW.account_id, NEW.locked_units
       USING ERRCODE = 'check_violation';
   END IF;
-  NEW.version := OLD.version + 1;
-  NEW.updated_at := now();
+
+  IF NOT v_allows_negative AND (NEW.available_units < 0 OR NEW.locked_units < 0) THEN
+    RAISE EXCEPTION
+      'user account % cannot go negative (available %, locked %): a withdrawal/fill may never overspend',
+      NEW.account_id, NEW.available_units, NEW.locked_units
+      USING ERRCODE = 'check_violation';
+  END IF;
+
   RETURN NEW;
 END;
 $$;
 
 DROP TRIGGER IF EXISTS balances_before_update ON public.balances;
-CREATE TRIGGER balances_before_update
-  BEFORE UPDATE ON public.balances
-  FOR EACH ROW EXECUTE FUNCTION public.balances_before_update();
+DROP TRIGGER IF EXISTS balances_before_write ON public.balances;
+CREATE TRIGGER balances_before_write
+  BEFORE INSERT OR UPDATE ON public.balances
+  FOR EACH ROW EXECUTE FUNCTION public.balances_before_write();
 
 -- every new account gets its balance row immediately, so writers never upsert
 CREATE OR REPLACE FUNCTION public.accounts_create_balance()
