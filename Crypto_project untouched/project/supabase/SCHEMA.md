@@ -251,3 +251,130 @@ the UI must never receive counterparty identity.
      ledger rows could be written without moving the cache. A deferred check now rejects that too.
 - **Not verified:** application to the real Supabase project, and any behaviour of the future matching
   engine, order-placement RPCs or edge functions — none of those are built here.
+
+---
+
+## 9. Matching engine (migration 7) and order book reads (migration 8)
+
+**Status: built and exercised on a scratch PostgreSQL; not deployed.**
+
+### Order lifecycle
+
+`new` -> (`partially_filled`) -> `filled` | `canceled` | `rejected`.
+There is no separate `open` status: an order is open while it is `new` or
+`partially_filled`, which is what the `orders_book_idx` partial index matches.
+
+- a **limit GTC** order rests in the book;
+- a **market** order (and any IOC) fills against the best opposite side and the
+  unfilled remainder is then cancelled with `cancel_reason='insufficient_liquidity'`
+  — fill-what-is-available, cancel-the-rest, deterministically;
+- a **FOK** order is pre-checked against the book and, if the whole quantity is
+  not fillable, stored as `rejected` / `reject_reason='fok_not_fillable'` with no
+  hold and no ledger rows at all.
+
+### Entry points
+
+| Function | Granted to | Notes |
+|---|---|---|
+| `place_order(market_symbol, side, type, qty_units, price_units, tif, client_order_id, user_id) -> jsonb` | `authenticated`, `service_role` | validates, holds, inserts, matches — one transaction |
+| `cancel_order(order_id, reason, user_id) -> jsonb` | `authenticated`, `service_role` | open orders only, releases the remaining hold |
+
+Everything else (`match_order`, `settle_fill`, `close_order`, `post_entry`,
+`book_fillable`, `order_result`, `ensure_user_account`, `system_account_id`,
+`assert_trading_enabled`, `resolve_order_actor`) is `REVOKE`d from `PUBLIC`,
+`anon`, `authenticated` and `service_role`; only the function owner (the
+migration role) and the two entry points use them. All are `SECURITY DEFINER`
+owned by the migration role, so RLS does not apply to them.
+
+**Identity.** `auth.uid()` decides the actor. A caller with a JWT may only act
+for themselves (`user_id` must be NULL or equal to the JWT subject); a caller with
+no JWT (server-side / `service_role`) must pass the user explicitly. The identity
+is never taken from the request body, and a JWT-holding caller passing somebody
+else's id is refused (`T11.3`).
+
+**Amounts.** All quantities and prices are integer base units. Fractional input
+is **rejected loudly** ("fractional amounts are rejected, not rounded") at the
+`place_order` boundary — the stronger guarantee the API needs, since `numeric(38,0)`
+columns would otherwise round 0.5 satoshi to 60001 silently (SCHEMA.md §2).
+
+### Matching algorithm
+
+Price-time priority: **best price first, then earliest `created_at`** (id as the
+tie-breaker). The incoming order is the taker, resting orders are makers, and the
+fill price is always the **maker's** price. Partial fills are normal. An order
+never trades with another order of the same user (self-match prevention), and the
+same rule is applied by the pre-trade liquidity scan, so the plan and the fills
+agree. Balance rows are locked in `account_id` order inside every fill so two
+fills touching the same accounts cannot deadlock.
+
+### Holds
+
+Placement holds the money the order can spend:
+
+| Order | Hold |
+|---|---|
+| sell | `qty_units` of base, available -> locked |
+| buy limit | `notional(qty, limit price)` + worst-case fee, available -> locked |
+| buy market | what the visible book can actually take (`book_fillable`) + worst-case fee |
+
+`orders.hold_released_units` counts everything no longer locked for the order
+(spent on fills **and** returned on close), so `hold_amount_units -
+hold_released_units` is exactly what is still locked, and the pre-trade hold can
+never be exceeded by the fills: per-fill truncation is monotone, so the sum of
+per-fill claims is <= the claim computed on the whole quantity. A hold the user
+cannot afford is refused **before** the order row exists (`T4.1`), and a fill that
+cannot overdraw the locked balance is additionally refused by the
+`balances_before_write` trigger from migration 2.
+
+### Settlement and the ledger
+
+Each fill is **one** `ledger_transactions` row of type `trade_fill` plus the
+entries below, written through `post_entry` — the single function that appends a
+ledger row *and* moves the matching cached balance in the same statement, which is
+what makes the deferred invariants of migration 3 impossible to break by engine
+code:
+
+```
+buyer  locked    <quote>  -(notional + buyer_fee)
+seller locked    <base>   -qty
+buyer  available <base>   +qty
+seller available <quote>  +(notional - seller_fee)
+FEE_INCOME available <quote> +(buyer_fee + seller_fee)
+```
+
+Zero-sum per asset, >= 2 distinct accounts, both directions of the balance
+invariant satisfied — asserted per fill and globally in the tests (`T8.*`).
+Fees are charged in the **quote** asset at `markets.maker_fee_bps` /
+`taker_fee_bps` (2/5 bps by default), truncated toward zero in the exchange's
+favour, and recorded on the immutable `trades` row together with the ledger
+transaction that settled it. Paper funding uses the same ledger path from
+`PAPER_FAUCET`; nothing in the engine invents a balance.
+
+### Mode gate
+
+`place_order`, `cancel_order` and `settle_fill` all call
+`assert_trading_enabled()`, the one place the mode is read: in paper mode
+(`mode='paper'`, the default) trading must be enabled by `paper_trading_enabled`,
+in live mode by `live_trading_enabled`, otherwise the engine raises and stays
+inert. Orders are always written to the environment that `app_settings.mode`
+names, so while the exchange is in paper mode no order, trade or ledger row can
+exist in `live` (the migration-1 `enforce_environment_gate` trigger enforces this
+independently, and `T9.*` covers both). Fine-grained `LIVE_*` wiring is step 12.
+
+**Flagged for the lead:** `cancel_order` is gated like the other money movers, per
+the brief, which means pausing trading also prevents users from releasing their
+own holds. If that is not wanted, the single `assert_trading_enabled()` call in
+`cancel_order` is the line to drop.
+
+### Order book and market data reads
+
+`v_markets`, `v_order_book_depth` (aggregated levels + cumulative quantity),
+`v_order_book_best` (best bid/ask, spread, last price) and `v_market_stats_24h`
+(trade count, open/last/low/high, base and quote volume over 24h). `authenticated`
+and `service_role` only; `anon` revoked.
+
+These four are deliberately **owner-run** (no `security_invoker`), unlike
+`v_my_balances`: under `security_invoker` the RLS policies on `orders`/`trades`
+would silently reduce the book to "my own orders". The property that matters is
+preserved by construction instead — **no user id, account id or order id is
+exposed** (asserted in `T12.4`).
