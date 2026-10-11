@@ -1,3 +1,22 @@
+-- GUARD: this suite reuses state that exchange_schema_tests.sql creates in the SAME database
+-- (the auth user 1111..., its funded paper accounts/orders, and the t.expect helper), so it must
+-- run after that suite in the same database. Run standalone it used to fail with
+-- 'schema "t" does not exist' and a misleading D5 double-entry error. Fail loudly instead.
+\set ON_ERROR_STOP on
+do $guard$
+begin
+  if to_regprocedure('t.expect(text,text,text,text,uuid)') is null then
+    raise exception 'exchange_ledger_invariant_tests.sql must run in the same database, after exchange_schema_tests.sql (helper t.expect is missing).';
+  end if;
+  if not exists (select 1 from public.accounts where user_id = '11111111-1111-1111-1111-111111111111' and kind = 'available') then
+    raise exception 'exchange_ledger_invariant_tests.sql needs the u1 paper accounts created by exchange_schema_tests.sql.';
+  end if;
+  if not exists (select 1 from public.ledger_entries) then
+    raise exception 'exchange_ledger_invariant_tests.sql needs the funded fixtures created by exchange_schema_tests.sql.';
+  end if;
+end $guard$;
+\set ON_ERROR_STOP off
+-- D1-D4 below deliberately raise a top-level ERROR: that error is the pass condition.
 \echo '=== D1: single-entry (unbalanced) transaction must be rejected at COMMIT'
 begin;
 insert into public.ledger_transactions (type, environment, idempotency_key) values ('correction','paper','bad-1');

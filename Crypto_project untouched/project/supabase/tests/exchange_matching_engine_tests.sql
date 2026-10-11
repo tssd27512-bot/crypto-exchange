@@ -2,6 +2,20 @@
 -- Scratch PostgreSQL only (see tests/README.md). Never run against the live project.
 -- PASS/FAIL lines are printed; the last line is a SUMMARY with the counts.
 
+-- GUARD: these fixtures are not idempotent; this suite must run against a freshly migrated
+-- scratch database. Running it a second time in the same database re-funds the same users,
+-- and every balance assertion below then fails (~17 FAILs plus a users_pkey error at line 65)
+-- while looking exactly like an engine regression. Fail loudly instead of reporting phantoms.
+\set ON_ERROR_STOP on
+do $guard$
+begin
+  if exists (select 1 from public.orders) or exists (select 1 from public.ledger_entries) then
+    raise exception 'exchange_matching_engine_tests.sql must run against a freshly migrated database (orders/ledger_entries are not empty). Recreate the scratch database and re-apply the migrations.';
+  end if;
+  if not exists (select 1 from public.assets where symbol = 'BTC') then
+    raise exception 'exchange_matching_engine_tests.sql needs the exchange migrations applied first.';
+  end if;
+end $guard$;
 create temp table t_res(seq serial, label text, ok boolean);
 
 create or replace function public.tc(p_label text, p_ok boolean) returns void

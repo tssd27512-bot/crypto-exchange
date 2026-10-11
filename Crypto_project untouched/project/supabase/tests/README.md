@@ -56,3 +56,41 @@ su postgres -c "psql -q -d gtvx_scratch -f $P/tests/exchange_ledger_invariant_te
 - PostgreSQL rounds values into a `numeric(38,0)` column. A fractional amount is therefore
   rounded to the nearest integer unit rather than rejected; the tests assert that documented
   behaviour explicitly.
+
+## Run every suite at once (recommended)
+
+```bash
+sudo ./tests/run_scratch_suites.sh "/path/to/Crypto_project untouched/project/supabase"
+```
+
+Creates two scratch databases, applies the stub + every migration to each, then runs
+`exchange_schema_tests.sql` -> `exchange_ledger_invariant_tests.sql` ->
+`exchange_immutability_rls_probe.sql` in the first database and
+`exchange_matching_engine_tests.sql` alone in the second. It prints one summary line per suite,
+exits non-zero if any suite is not green, and keeps raw logs in `$LOGDIR` (default `/tmp/pr3-logs`).
+
+| suite | green means |
+|---|---|
+| `exchange_schema_tests.sql` | `NOTICE:  PASS` 112, `NOTICE:  FAIL` 0, 0 `psql ... ERROR` |
+| `exchange_ledger_invariant_tests.sql` | exactly 4 `psql ... ERROR` lines (D1-D4 are the pass condition), `NOTICE:  PASS` 5, `NOTICE:  FAIL` 0 |
+| `exchange_immutability_rls_probe.sql` | `NOTICE:  PASS` 56, `NOTICE:  FAIL` 0 — ledger immutability as postgres/authenticated/anon plus the full RLS matrix |
+| `exchange_matching_engine_tests.sql` | `SUMMARY total=63 pass=63 fail=0` |
+
+## Suite dependencies and gotchas (learned the hard way)
+
+- `exchange_ledger_invariant_tests.sql` and `exchange_immutability_rls_probe.sql` **must run in the
+  same database as, and after, `exchange_schema_tests.sql`**: they reuse its fixtures (auth user
+  `1111…1111`, its funded paper accounts/orders/ledger rows) and its `t.expect` helper. Both now
+  refuse to run with an explanation if that order is broken; without the guards they died with
+  `schema "t" does not exist` and a misleading D5 double-entry error.
+- `exchange_matching_engine_tests.sql` **must run against a freshly migrated database**: its fixtures
+  are not idempotent, so a second run in the same database re-funds the same users and reports 17
+  FAILs plus a `users_pkey` error at line 65 (`SUMMARY total=61 pass=44 fail=17`) that look exactly
+  like an engine regression. It now refuses to start in that case.
+- The repo path contains a space — never `for f in $(ls "$P"/migrations/*.sql)` in a shell harness, or
+  the list word-splits and the migration filenames are cut in half.
+- Read results with `grep -E 'NOTICE:  (PASS|FAIL)'`: every line carries a `psql:file:line: NOTICE:`
+  prefix, so a grep for `^ PASS` silently matches nothing.
+- The book/market views (`v_order_book_best`, `v_order_book_depth`, `v_markets`) are readable only with
+  a privileged token — `SELECT` is not granted to `anon`/`authenticated`. Client roles get
+  `permission denied for view`, which is what the probe asserts.

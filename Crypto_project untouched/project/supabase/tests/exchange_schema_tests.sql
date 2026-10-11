@@ -279,4 +279,16 @@ select t.expect('service_role has no UPDATE on order_events', $q$select has_tabl
 select t.expect('RLS enabled on all 10 exchange tables', $q$select count(*)::text from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relrowsecurity and c.relname in ('app_settings','assets','markets','accounts','balances','ledger_transactions','ledger_entries','orders','order_events','trades')$q$, '10');
 select t.expect('no policy on exchange tables mentions anon', $q$select count(*)::text from pg_policies where schemaname = 'public' and 'anon' = any(roles) and tablename in ('app_settings','assets','markets','accounts','balances','ledger_transactions','ledger_entries','orders','order_events','trades')$q$, '0');
 select t.expect('no write policy for authenticated on exchange tables', $q$select count(*)::text from pg_policies where schemaname = 'public' and 'authenticated' = any(roles) and cmd <> 'SELECT' and tablename in ('app_settings','assets','markets','accounts','balances','ledger_transactions','ledger_entries','orders','order_events','trades')$q$, '0');
-select t.expect('existing chat tables are untouched (still no RLS on admin_users)', $q$select count(*)::text from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname in ('chat_conversations','chat_messages','admin_users')$q$, '0');
+-- Pre-existing chat/admin tables, created on main by 20260916105205_create_live_chat_tables.sql.
+-- That baseline migration ENABLES RLS on all three tables and defines 3 policies on
+-- chat_conversations and 2 on chat_messages (admin_users keeps RLS on with no policy, i.e. it
+-- is service-role only). The invariant the exchange migrations must preserve is therefore
+-- "unchanged since baseline", not "no RLS": the previous line here counted *existing* tables
+-- (3) against an expected 0 and could never pass, whatever the engine did.
+-- Fingerprint = relname:rls_enabled:policy_count, ordered by name.
+select t.expect('pre-existing chat/admin tables are unchanged by the exchange migrations',
+  $q$select string_agg(c.relname || ':' || c.relrowsecurity::text || ':' ||
+        (select count(*) from pg_policies p where p.schemaname = 'public' and p.tablename = c.relname)::text, ',' order by c.relname)
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public' and c.relname in ('chat_conversations','chat_messages','admin_users')$q$,
+  'admin_users:true:0,chat_conversations:true:3,chat_messages:true:2');
