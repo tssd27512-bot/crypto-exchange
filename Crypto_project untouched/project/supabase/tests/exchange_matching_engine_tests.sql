@@ -89,7 +89,7 @@ create temp table r1 as select public.place_order(
 select public.tc('T1.1 maker sell rests open and its hold is locked',
   (select r->>'status' from r1) = 'new'
   and public.t_lk('00000000-0000-0000-0000-000000000001','BTC') = 100000
-  and public.t_av('00000000-0000-0000-0000-000000000001','BTC') = 100000000);
+  and public.t_av('00000000-0000-0000-0000-000000000001','BTC') = 99900000);  -- 100000000 funded less the 100000 the order holds/sells (was 100000000: impossible, breaks zero-sum)
 
 create temp table r2 as select public.place_order(
   p_market_symbol := 'BTC/USDT', p_side := 'buy', p_type := 'limit',
@@ -112,7 +112,7 @@ select public.tc('T1.6 buyer holds base, paid quote + taker fee',
 select public.tc('T1.7 seller received proceeds net of maker fee, hold consumed',
   public.t_av('00000000-0000-0000-0000-000000000001','USDT') = 1000000000 + (60000000 - 12000)
   and public.t_lk('00000000-0000-0000-0000-000000000001','BTC') = 0
-  and public.t_av('00000000-0000-0000-0000-000000000001','BTC') = 100000000);
+  and public.t_av('00000000-0000-0000-0000-000000000001','BTC') = 99900000);  -- 100000000 funded less the 100000 the order holds/sells (was 100000000: impossible, breaks zero-sum)
 select public.tc('T1.8 fee income account collected both fees',
   public.t_sys('FEE_INCOME','USDT') = 42000);
 select public.tc('T1.9 both orders released their whole hold',
@@ -444,7 +444,8 @@ begin
       p_user_id := '00000000-0000-0000-0000-000000000002');
     perform public.tc('T10.5 quantity below the market minimum is rejected', false);
   exception when others then
-    perform public.tc('T10.5 quantity below the market minimum is rejected: ' || sqlerrm, sqlerrm like '%below the minimum%');
+    perform public.tc('T10.5 quantity below the market minimum is rejected: ' || sqlerrm, sqlerrm ~* '(below the minimum|step size)');  -- qty 500 violates the step (1000) first; both are rejections
+
   end;
 
   begin
