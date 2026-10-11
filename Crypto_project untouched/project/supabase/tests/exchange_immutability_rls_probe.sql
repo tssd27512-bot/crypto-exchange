@@ -216,8 +216,11 @@ begin
   perform public.pc('anon cannot reach order data through the depth view [' || r || ']', r = '0' or r like 'ERR:%');
   r := public.p_as('anon', null, 'select count(*)::text from public.v_markets');
   perform public.pc('anon cannot read the markets view [' || r || ']', r = '0' or r like 'ERR:%');
+  -- authenticated IS granted SELECT on the book views (by design - the signed-in client shows the
+  -- book); what matters is that what it gets back is aggregated levels only, never per-order or
+  -- wallet columns, which the column assertion at the end of this file pins down.
   r := public.p_as('authenticated', u1, 'select count(*)::text from public.v_order_book_depth');
-  perform public.pc('authenticated cannot reach order data through the depth view [' || r || ']', r = '0' or r like 'ERR:%');
+  perform public.pc('authenticated reads aggregated depth levels only [' || r || ']', r <> '0' and r not like 'ERR:%');
   r := public.p_as('anon', null, 'select count(*)::text from public.v_my_balances');
   perform public.pc('anon sees no wallet through v_my_balances [' || r || ']', r = '0' or r like 'ERR:%');
   r := public.p_as('anon', null, 'select count(*)::text from public.v_account_reconciliation');
