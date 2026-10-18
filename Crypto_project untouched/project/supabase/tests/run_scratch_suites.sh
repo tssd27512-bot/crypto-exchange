@@ -47,6 +47,9 @@ apply "$DB_CORE"
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_schema_tests.sql'"          > "$LOGDIR/schema.log" 2>&1
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_ledger_invariant_tests.sql'" > "$LOGDIR/ledger.log" 2>&1
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_immutability_rls_probe.sql'" > "$LOGDIR/immutability_rls.log" 2>&1
+# deposit layer: needs the schema fixtures (users) and the t/d helpers, so it runs
+# last in the core database. It refuses to run twice in the same database.
+psql_ "-q -d $DB_CORE -f '$P/tests/exchange_deposit_tests.sql'" > "$LOGDIR/deposits.log" 2>&1
 apply "$DB_MATCH"
 psql_ "-q -d $DB_MATCH -f '$P/tests/exchange_matching_engine_tests.sql'" > "$LOGDIR/matching.log" 2>&1
 
@@ -62,6 +65,8 @@ grep -E 'SUMMARY' "$LOGDIR/matching.log" || true
 report schema          "$LOGDIR/schema.log"          0
 report ledger          "$LOGDIR/ledger.log"          4
 report immutability_rls "$LOGDIR/immutability_rls.log" 0
+report deposits          "$LOGDIR/deposits.log"          0
 grep -E 'SUMMARY' "$LOGDIR/matching.log" | grep -q 'fail=0' || rc=1
+grep -E 'SUMMARY' "$LOGDIR/deposits.log" | grep -q 'fail=0' || rc=1
 echo "logs in $LOGDIR ; exit status $rc"
 exit $rc
