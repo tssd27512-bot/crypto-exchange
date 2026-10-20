@@ -16,7 +16,7 @@ Foundational schema + RLS + immutable ledger for the exchange backend.
 
 | Table | Purpose | Key columns |
 |---|---|---|
-| `app_settings` | One-row global switch. Holds the paper/live `mode` and the feature flags. Physically limited to one row by `CHECK (id)`. | `mode`, `live_trading_enabled`, `deposits_enabled`, `withdrawals_enabled`, `live_enabled_at` |
+| `app_settings` | One-row global switch. Holds the paper/live `mode` and the feature flags. Physically limited to one row by `CHECK (id)`. | `mode`, `live_trading_enabled`, `deposits_enabled`, `paper_deposits_enabled`, `withdrawals_enabled`, `live_enabled_at` |
 | `assets` | Coin/token reference data. `base_decimals` defines the integer ledger unit (BTC 8, ETH 18, USDT 6, SOL 9). Seeded with BTC/ETH/USDT/SOL. | `symbol` (unique), `base_decimals`, `chain`, `contract_address` |
 | `markets` | Trading pairs, separated per environment. Holds precision, tick/step sizes, min sizes and maker/taker fees as **configuration** (defaults 2/5 bps to match the fee copy on the site). Seeded with paper BTC/USDT, ETH/USDT, SOL/USDT. | `base_asset_id`, `quote_asset_id`, `environment`, `price_scale`, `notional_scale`, `price_tick_units`, `qty_step_units` |
 | `accounts` | Wallet container. One row per owner × asset × kind × environment. `account_type='user'` (linked to `auth.users`) or `account_type='system'` with a `code` (double-entry counterparty: `PAPER_FAUCET`, `FEE_INCOME`, later `EXTERNAL_DEPOSIT`/`EXTERNAL_WITHDRAWAL`). | `user_id`, `code`, `asset_id`, `kind`, `environment` |
@@ -168,6 +168,11 @@ KYC state change can never touch a money row.
   (`enforce_environment_gate`) on `accounts`, `ledger_transactions`, `orders` and `trades` rejects any
   `environment = 'live'` row while `mode <> 'live'`, or while the relevant feature flag
   (`live_trading_enabled` / `deposits_enabled` / `withdrawals_enabled`) is off.
+- **The paper deposit path has its own switch.** `app_settings.paper_deposits_enabled` (default
+  **true**) gates the paper sandbox only: while it is false, `record_deposit()` and
+  `credit_deposit()` of a paper-environment deposit are refused with their own distinct message.
+  It never opens or closes the live path, and `deposits_enabled` never opens or closes the paper
+  path — see the deposits section for the two switches side by side.
 - Paper mode is funded from the seeded `PAPER_FAUCET` system account via `paper_funding` /
   `admin_adjustment` transactions, so paper trading exercises the same engine and the same ledger without
   touching real funds.
@@ -448,9 +453,24 @@ confirmation source exists in this step — the adapter is not implemented.
 path produced a deposit is visible in the row and the two paths cannot be mixed in either
 direction. Paper deposits are never represented as chain-verified.
 
-**Flagged for the lead:** (1) in paper mode the operator/test path is not gated by
-`deposits_enabled` — that flag is the DB side of `LIVE_DEPOSITS_ENABLED` and gates the live
-path (asserted in both directions in the scratch suite); (2) `required_confirmations = 0` is
+### The two deposit switches (owner directive: paper deposits get their own control)
+
+| switch | default | what it gates | refusal message |
+|---|---|---|---|
+| `deposits_enabled` | **false** | the LIVE path only, and only while `mode = 'live'` — the DB side of `LIVE_DEPOSITS_ENABLED`; `enforce_environment_gate` refuses a live row independently | `live deposits are disabled: ...` |
+| `paper_deposits_enabled` | **true** | the PAPER path only: `record_deposit()` and `credit_deposit()` of a paper-environment deposit, via `assert_paper_deposits_enabled()` | `paper deposits are disabled: ...` |
+
+Neither switch can substitute for the other: with the paper switch ON and the exchange in
+paper mode, a live deposit row is still refused, and with the live switch ON the paper
+operator path is still refused outside paper mode. The paper switch defaults ON because paper
+is the non-money sandbox; the live switch defaults OFF because it moves real funds. Both are
+asserted in both directions in the scratch suite (D6 for the live switch, D7 for the paper
+switch, every flip reverted before the suite ends).
+
+**Flagged for the lead:** (1) the paper path is gated by its own switch
+(`paper_deposits_enabled`, default true), not by `deposits_enabled` — that flag is the DB side
+of `LIVE_DEPOSITS_ENABLED` and gates the live path only (both switches asserted in both
+directions in the scratch suite); (2) `required_confirmations = 0` is
 refused as "no policy configured", which is stricter than treating 0 as "credit on sight";
 (3) a confirmed-but-uncredited deposit can still be failed by an operator, but a credited one
 cannot — reversal needs a compensating ledger transaction, out of scope here.

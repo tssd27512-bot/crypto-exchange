@@ -17,12 +17,18 @@
 -- confirmed, failed, under review — crediting is DATA on a confirmed row, not a
 -- status. See the migration header for the mapping from the earlier draft names.
 --
--- Gating choice this suite pins down: in paper mode the operator/test path is NOT
--- gated by app_settings.deposits_enabled — that flag is the DB side of the plan's
--- LIVE_DEPOSITS_ENABLED and gates the live path (the provider adapter), which D6
--- asserts in both directions: flag off -> a live adapter event is refused; flag on
--- (scratch DB only) -> the same event is accepted. The flip happens in this
--- database only and is reverted before the suite ends.
+-- Gating choices this suite pins down (two switches, one per mode):
+--   * LIVE: app_settings.deposits_enabled is the DB side of the plan's
+--     LIVE_DEPOSITS_ENABLED and gates the live path (the provider adapter), which D6
+--     asserts in both directions: flag off -> a live adapter event is refused; flag on
+--     (scratch DB only) -> the same event is accepted.
+--   * PAPER: app_settings.paper_deposits_enabled (default true) gates the paper
+--     sandbox, which D7 asserts in both directions: switch off -> record_deposit() and
+--     credit_deposit() of a paper deposit are refused with their own distinct message;
+--     switch back on -> both succeed. D7 also pins that the live gate is unaffected by
+--     the paper switch.
+-- Every flag flip happens in this scratch database only and is reverted before the
+-- suite ends.
 -- =====================================================================
 
 do $g$
@@ -444,17 +450,17 @@ select public.d_expect('service_role sees every address',
 select public.d_expect('no privileged deposit function is executable by anon, authenticated or PUBLIC',
   $q$select count(*)::text from pg_proc p join pg_namespace n on n.oid = p.pronamespace
          where n.nspname = 'public'
-           and p.proname in ('assert_deposits_enabled','register_deposit_network','register_deposit_address',
+           and p.proname in ('assert_deposits_enabled','assert_paper_deposits_enabled','register_deposit_network','register_deposit_address',
                              'record_deposit','record_provider_deposit','_deposit_ingest','set_deposit_confirmations',
                              'confirm_deposit','set_deposit_under_review','fail_deposit','credit_deposit')
            and (has_function_privilege('anon', p.oid, 'EXECUTE') or has_function_privilege('authenticated', p.oid, 'EXECUTE'))$q$, '0');
-select public.d_expect('all eleven service_role entry points exist and are executable by service_role',
+select public.d_expect('all twelve service_role entry points exist and are executable by service_role',
   $q$select count(*)::text from pg_proc p join pg_namespace n on n.oid = p.pronamespace
          where n.nspname = 'public'
-           and p.proname in ('assert_deposits_enabled','register_deposit_network','register_deposit_address',
+           and p.proname in ('assert_deposits_enabled','assert_paper_deposits_enabled','register_deposit_network','register_deposit_address',
                              'record_deposit','record_provider_deposit','_deposit_ingest','set_deposit_confirmations',
                              'confirm_deposit','set_deposit_under_review','fail_deposit','credit_deposit')
-           and has_function_privilege('service_role', p.oid, 'EXECUTE')$q$, '11');
+           and has_function_privilege('service_role', p.oid, 'EXECUTE')$q$, '12');
 select public.d_expect('no view exposes deposit data',
   $q$select count(*)::text from pg_views where schemaname = 'public' and (definition ilike '%deposit%' or viewname ilike '%deposit%')$q$, '0');
 select public.d_expect('the deposit tables are not in a publication (no realtime leak)',
@@ -519,6 +525,84 @@ select public.d_expect('every surviving deposit is a paper_operator row',
 select public.d_expect('the paper operator path still works while deposits_enabled = false (the flag gates the live path)',
   $q$select (select count(*) from public.deposits where txid = 'TESTFIXTUREPAPER1')::text || '/' || environment from public.deposits where txid = 'TESTFIXTUREPAPER1'$q$,
   '1/paper');
+
+\echo '=== D7. paper_deposits_enabled — the paper sandbox switch (flipped in THIS database only)'
+select public.d_expect('the paper switch starts ON while the live switch is OFF (paper/false/true)',
+  $q$select mode || '/' || deposits_enabled::text || '/' || paper_deposits_enabled::text from public.app_settings$q$,
+  'paper/false/true');
+select public.d_run('record a creditable paper deposit while the paper switch is ON (setup)',
+  $q$select public.record_deposit('11111111-1111-1111-1111-111111111111', 'BTC', 'bitcoin', 'TESTFIXTUREPAPERGATE1', 100000000, -1, null, null, 3)$q$);
+select public.d_expect('... it is a confirmed, uncredited paper row (ready for the credit refusal)',
+  $q$select environment || '/' || status || '/' || (credited_ledger_transaction_id is null)::text from public.deposits where txid = 'TESTFIXTUREPAPERGATE1'$q$,
+  'paper/confirmed/true');
+select public.d_run('switch paper deposits OFF (scratch database only)',
+  $q$update public.app_settings set paper_deposits_enabled = false$q$);
+select public.d_expect('the paper switch reads back OFF, with mode and the live switch untouched',
+  $q$select mode || '/' || deposits_enabled::text || '/' || paper_deposits_enabled::text from public.app_settings$q$,
+  'paper/false/false');
+select public.d_expect_error('with the paper switch OFF, record_deposit is refused',
+  $q$select public.record_deposit('11111111-1111-1111-1111-111111111111', 'BTC', 'bitcoin', 'TESTFIXTUREPAPERGATE2', 100000000, -1, null, null, 3)$q$,
+  'paper deposits are disabled');
+select public.d_expect('... and no row was written for it',
+  $q$select count(*)::text from public.deposits where txid = 'TESTFIXTUREPAPERGATE2'$q$, '0');
+select public.d_expect_error('with the paper switch OFF, credit_deposit of a paper deposit is refused',
+  $q$select public.credit_deposit((select id from public.deposits where txid = 'TESTFIXTUREPAPERGATE1'))$q$,
+  'paper deposits are disabled');
+select public.d_expect('... and the refused credit left no credit data behind',
+  $q$select (credited_ledger_transaction_id is null and credited_at is null)::text from public.deposits where txid = 'TESTFIXTUREPAPERGATE1'$q$,
+  'true');
+do $g$
+declare v_rec text; v_cred text;
+begin
+  begin
+    perform public.record_deposit('11111111-1111-1111-1111-111111111111', 'BTC', 'bitcoin', 'TESTFIXTUREPAPERGATE3', 100000000, -1, null, null, 3);
+  exception when others then v_rec := sqlerrm; end;
+  begin
+    perform public.credit_deposit((select id from public.deposits where txid = 'TESTFIXTUREPAPERGATE1'));
+  exception when others then v_cred := sqlerrm; end;
+  insert into public.d_ret(label, val) values ('paper_record_msg', v_rec), ('paper_credit_msg', v_cred);
+end $g$;
+select public.d_expect('both paper refusals carry the paper message and not the live one (distinct errors)',
+  $q$select count(*)::text from public.d_ret
+         where label in ('paper_record_msg','paper_credit_msg')
+           and val like 'paper deposits are disabled:%'
+           and val not like '%live deposits are disabled%'$q$, '2');
+select public.d_run('switch paper deposits back ON (scratch database only)',
+  $q$update public.app_settings set paper_deposits_enabled = true$q$);
+select public.d_expect('the paper switch reads back ON, live switch and mode still untouched (paper/false/true)',
+  $q$select mode || '/' || deposits_enabled::text || '/' || paper_deposits_enabled::text from public.app_settings$q$,
+  'paper/false/true');
+select public.d_run('with the switch ON, record_deposit accepts the same paper deposit',
+  $q$select public.record_deposit('11111111-1111-1111-1111-111111111111', 'BTC', 'bitcoin', 'TESTFIXTUREPAPERGATE2', 100000000, -1, null, null, 3)$q$);
+select public.d_expect('... and it is a confirmed paper row written by the operator/test path',
+  $q$select environment || '/' || status || '/' || source from public.deposits where txid = 'TESTFIXTUREPAPERGATE2'$q$,
+  'paper/confirmed/paper_operator');
+select public.d_run('with the switch ON, credit_deposit credits the paper deposit',
+  $q$select public.credit_deposit((select id from public.deposits where txid = 'TESTFIXTUREPAPERGATE1'))$q$);
+select public.d_expect('... the credit is data on the row and points at a paper deposit_credit ledger transaction',
+  $q$select d.status || '/' || (d.credited_ledger_transaction_id is not null)::text || '/' || lt.type || '/' || lt.environment
+          from public.deposits d join public.ledger_transactions lt on lt.id = d.credited_ledger_transaction_id
+         where d.txid = 'TESTFIXTUREPAPERGATE1'$q$,
+  'confirmed/true/deposit_credit/paper');
+select public.d_expect('... and that ledger transaction is balanced (two postings, zero sum)',
+  $q$select count(*)::text || '/' || coalesce(sum(e.amount_units), 0)::text
+          from public.ledger_entries e join public.deposits d on d.credited_ledger_transaction_id = e.transaction_id
+         where d.txid = 'TESTFIXTUREPAPERGATE1'$q$,
+  '2/0');
+select public.d_expect_error('the live gate is unaffected by the paper switch: with the paper switch ON a live row is still refused in paper mode',
+  $q$insert into public.deposits (user_id, asset_id, network, environment, source, txid, amount_units, required_confirmations, status)
+     select '11111111-1111-1111-1111-111111111111', a.id, 'bitcoin', 'live', 'provider_adapter', 'TESTFIXTURELIVEPAPERGATE1', 100000000, 3, 'pending' from public.assets a where a.symbol = 'BTC';
+     select 'inserted'$q$, 'live row rejected');
+select public.d_expect_error('... and the live adapter path is still refused while the exchange is in paper mode',
+  $q$select public.record_provider_deposit('{"network":"bitcoin","asset_symbol":"BTC","user_id":"11111111-1111-1111-1111-111111111111","txid":"TESTFIXTURELIVEPAPERGATE2","amount_units":100000000}'::jsonb)$q$,
+  'live-only');
+select public.d_expect('no live deposit row exists after the paper-switch probe',
+  $q$select count(*)::text from public.deposits where environment = 'live'$q$, '0');
+select public.d_expect('the source/environment pairing CHECK is intact after the paper-switch probe',
+  $q$select count(*)::text from public.deposits where (source = 'provider_adapter') <> (environment = 'live')$q$, '0');
+select public.d_expect('the switches end where they started (paper, live flags off, paper deposits on)',
+  $q$select mode || '/' || live_trading_enabled::text || '/' || deposits_enabled::text || '/' || paper_deposits_enabled::text || '/' || (live_enabled_at is null)::text from public.app_settings$q$,
+  'paper/false/false/true/true');
 
 \echo '=== SUMMARY'
 select 'SUMMARY total=' || count(*) || ' pass=' || count(*) filter (where ok)

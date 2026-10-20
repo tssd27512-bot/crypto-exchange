@@ -154,12 +154,20 @@ Related tables: `ledger_transactions.type = 'deposit_credit'` and `reference_typ
 
 Gating (paper mode vs live)
 ---------------------------
-`assert_deposits_enabled()` is the one place the deposit switch is read.
-`app_settings.deposits_enabled` is the DB side of the plan's `LIVE_DEPOSITS_ENABLED`:
-while `mode = 'live'` a deposit write is refused unless it is true, and the
-`enforce_environment_gate` trigger (migration 1, which maps the table name `deposits` to
-exactly that flag) refuses a live row a second time independently. In paper mode the
-operator mechanics are **not** gated by the flag — it is the real-money (live) switch.
+Two switches, one per mode, and neither can stand in for the other:
+
+- The LIVE path is **double-gated**. `assert_deposits_enabled()` reads
+  `app_settings.deposits_enabled` (the DB side of the plan's `LIVE_DEPOSITS_ENABLED`):
+  while `mode = 'live'` a deposit write is refused unless it is true, and the
+  `enforce_environment_gate` trigger (migration 1, which maps the table name `deposits`
+  to exactly that flag) refuses a live row a second time independently.
+- The PAPER path is gated by its own flag, `app_settings.paper_deposits_enabled`
+  (default **true** — paper is the non-money sandbox, so it starts open).
+  `assert_paper_deposits_enabled()` is the one place that switch is read: while it is
+  false, `record_deposit()` (the paper operator/test path) and `credit_deposit()` of a
+  paper-environment deposit are refused with their own, distinct error message.
+  Flipping it never opens or closes the live path, and flipping `deposits_enabled`
+  never opens or closes the paper path.
 There is no automatic path in this step: every deposit row is written by `record_deposit()`
 (paper) or `record_provider_deposit()` (live) with the txid the caller supplies.
 */
@@ -429,6 +437,20 @@ COMMENT ON FUNCTION public.deposits_before_update() IS
   'Implemented as a trigger: enforces the deposit state machine (pending/confirming/confirmed/failed/under review) and the immutability of the chain identity, of the credit data and of a monotone confirmation count. Financial statuses are only reachable through the SECURITY DEFINER entry points below — anon/authenticated have no UPDATE privilege on public.deposits at all.';
 
 -- ---------------------------------------------------------------------------
+-- the paper sandbox switch: app_settings.paper_deposits_enabled
+--
+-- The live path stays double-gated (mode = 'live' AND deposits_enabled). The paper
+-- path has its own flag, defaulting ON because paper is the non-money sandbox: an
+-- operator can stop paper deposit recording and paper crediting without touching the
+-- live switch or the paper/live mode, and neither flag can substitute for the other.
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.app_settings
+  ADD COLUMN IF NOT EXISTS paper_deposits_enabled boolean NOT NULL DEFAULT true;
+
+COMMENT ON COLUMN public.app_settings.paper_deposits_enabled IS
+  'Paper-sandbox deposit switch, default true. The live path is double-gated by app_settings.mode = ''live'' AND app_settings.deposits_enabled; the paper path (record_deposit() and credit_deposit() of a paper-environment deposit) is gated by this flag alone. False refuses paper deposit recording and paper crediting with a distinct message and leaves the live gate untouched.';
+
+-- ---------------------------------------------------------------------------
 -- the deposit gate: the DB side of LIVE_DEPOSITS_ENABLED
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.assert_deposits_enabled()
@@ -463,6 +485,37 @@ END $$;
 
 COMMENT ON FUNCTION public.assert_deposits_enabled() IS
   'Reads the single app_settings row and raises when a deposit write is not allowed (live mode with deposits_enabled = false). Returns the mode deposits are written in. Called by every deposit entry point; the deposits table carries enforce_environment_gate as the independent second gate.';
+
+-- the paper sandbox gate: the DB side of the paper deposit switch
+CREATE OR REPLACE FUNCTION public.assert_paper_deposits_enabled()
+RETURNS void
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_paper boolean;
+BEGIN
+  SELECT paper_deposits_enabled
+    INTO v_paper
+    FROM public.app_settings
+   WHERE id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'app_settings has no row: the paper deposit gate cannot be evaluated'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF NOT COALESCE(v_paper, false) THEN
+    RAISE EXCEPTION
+      'paper deposits are disabled: app_settings.paper_deposits_enabled = false; refusing to record or credit paper deposits (the paper sandbox switch, independent of the live deposits_enabled gate)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+
+COMMENT ON FUNCTION public.assert_paper_deposits_enabled() IS
+  'Reads app_settings.paper_deposits_enabled and raises when paper deposits are switched off. Called by the paper path only: record_deposit() (via _deposit_ingest) and credit_deposit() for a paper-environment deposit. The live path never reads it — live deposits are gated by mode = live AND deposits_enabled.';
 
 -- ---------------------------------------------------------------------------
 -- operator path 1: register a network and an address (nothing generated)
@@ -632,6 +685,12 @@ BEGIN
   END IF;
 
   PERFORM public.assert_deposits_enabled();
+
+  -- the paper sandbox switch: only the paper path reads it (the live path is gated by
+  -- deposits_enabled above and by enforce_environment_gate on the table)
+  IF p_source = 'paper_operator' THEN
+    PERFORM public.assert_paper_deposits_enabled();
+  END IF;
 
   IF p_user_id IS NULL OR NOT EXISTS (SELECT 1 FROM auth.users u WHERE u.id = p_user_id) THEN
     RAISE EXCEPTION 'unknown user %: a deposit belongs to exactly one user', p_user_id
@@ -1023,6 +1082,12 @@ BEGIN
     RAISE EXCEPTION 'unknown deposit %', p_deposit_id USING ERRCODE = 'no_data_found';
   END IF;
 
+  -- a paper-environment credit obeys the paper sandbox switch; a live credit is gated
+  -- by deposits_enabled (assert_deposits_enabled above) and is untouched here
+  IF v_dep.environment = 'paper' THEN
+    PERFORM public.assert_paper_deposits_enabled();
+  END IF;
+
   -- guard #2 of the idempotency: an explicit, readable refusal
   IF v_dep.credited_ledger_transaction_id IS NOT NULL THEN
     RAISE EXCEPTION 'deposit % is already credited by ledger transaction %: a chain transaction can never be credited twice',
@@ -1205,7 +1270,8 @@ BEGIN
       JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'public'
        AND p.proname IN (
-         'assert_deposits_enabled', 'register_deposit_network', 'register_deposit_address',
+         'assert_deposits_enabled', 'assert_paper_deposits_enabled',
+         'register_deposit_network', 'register_deposit_address',
          'record_deposit', 'record_provider_deposit', '_deposit_ingest',
          'set_deposit_confirmations', 'confirm_deposit', 'set_deposit_under_review',
          'fail_deposit', 'credit_deposit'
