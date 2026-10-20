@@ -16,7 +16,7 @@ Foundational schema + RLS + immutable ledger for the exchange backend.
 
 | Table | Purpose | Key columns |
 |---|---|---|
-| `app_settings` | One-row global switch. Holds the paper/live `mode` and the feature flags. Physically limited to one row by `CHECK (id)`. | `mode`, `live_trading_enabled`, `deposits_enabled`, `withdrawals_enabled`, `live_enabled_at` |
+| `app_settings` | One-row global switch. Holds the paper/live `mode` and the feature flags. Physically limited to one row by `CHECK (id)`. | `mode`, `live_trading_enabled`, `deposits_enabled`, `paper_deposits_enabled`, `withdrawals_enabled`, `live_enabled_at` |
 | `assets` | Coin/token reference data. `base_decimals` defines the integer ledger unit (BTC 8, ETH 18, USDT 6, SOL 9). Seeded with BTC/ETH/USDT/SOL. | `symbol` (unique), `base_decimals`, `chain`, `contract_address` |
 | `markets` | Trading pairs, separated per environment. Holds precision, tick/step sizes, min sizes and maker/taker fees as **configuration** (defaults 2/5 bps to match the fee copy on the site). Seeded with paper BTC/USDT, ETH/USDT, SOL/USDT. | `base_asset_id`, `quote_asset_id`, `environment`, `price_scale`, `notional_scale`, `price_tick_units`, `qty_step_units` |
 | `accounts` | Wallet container. One row per owner × asset × kind × environment. `account_type='user'` (linked to `auth.users`) or `account_type='system'` with a `code` (double-entry counterparty: `PAPER_FAUCET`, `FEE_INCOME`, later `EXTERNAL_DEPOSIT`/`EXTERNAL_WITHDRAWAL`). | `user_id`, `code`, `asset_id`, `kind`, `environment` |
@@ -168,6 +168,11 @@ KYC state change can never touch a money row.
   (`enforce_environment_gate`) on `accounts`, `ledger_transactions`, `orders` and `trades` rejects any
   `environment = 'live'` row while `mode <> 'live'`, or while the relevant feature flag
   (`live_trading_enabled` / `deposits_enabled` / `withdrawals_enabled`) is off.
+- **The paper deposit path has its own switch.** `app_settings.paper_deposits_enabled` (default
+  **true**) gates the paper sandbox only: while it is false, `record_deposit()` and
+  `credit_deposit()` of a paper-environment deposit are refused with their own distinct message.
+  It never opens or closes the live path, and `deposits_enabled` never opens or closes the paper
+  path — see the deposits section for the two switches side by side.
 - Paper mode is funded from the seeded `PAPER_FAUCET` system account via `paper_funding` /
   `admin_adjustment` transactions, so paper trading exercises the same engine and the same ledger without
   touching real funds.
@@ -378,3 +383,94 @@ These four are deliberately **owner-run** (no `security_invoker`), unlike
 would silently reduce the book to "my own orders". The property that matters is
 preserved by construction instead — **no user id, account id or order id is
 exposed** (asserted in `T12.4`).
+
+## Deposit layer (step 6 — owner statuses, provider-adapter contract, paper vs live)
+
+`deposits`, `deposit_addresses`, `deposit_networks`. Statuses are exactly the owner's five:
+`pending`, `confirming`, `confirmed`, `failed`, `under review`. **Crediting is data, not a
+status**: `credit_deposit()` posts the ledger transaction and writes
+`credited_ledger_transaction_id` + `credited_at` on the still-`confirmed` row in one call
+(`CHECK (credited_at IS NULL OR (status = 'confirmed' AND confirmations >= required_confirmations))`),
+and it only accepts a `confirmed` deposit — a deposit `under review` or below its policy is
+refused with a specific message.
+
+State machine, enforced by the `deposits_before_update` trigger:
+
+| from | to |
+|---|---|
+| `pending` | `confirming`, `confirmed`, `failed`, `under review` |
+| `confirming` | `confirmed`, `failed`, `under review` |
+| `under review` | `confirmed`, `failed` |
+| `confirmed` | `failed`, only while the row is **not credited** (a credited row can never leave `confirmed` — `deposits_credit_state_check`) |
+| `failed` | terminal |
+
+Mapping from the earlier draft of this migration (never deployed anywhere):
+`detected → pending`; `confirming → confirming`; `credited → dropped as a status, credit
+data on a `confirmed` row`; `cancelled → failed + failed_reason`; `orphaned → failed +
+failed_reason`; `reorged → failed + failed_reason`.
+
+Entry points (all `service_role` only; `anon`/`authenticated` hold no privilege and no policy
+on these three tables): `record_deposit` (paper), `record_provider_deposit` (live adapter),
+`set_deposit_confirmations`, `confirm_deposit`, `set_deposit_under_review`, `fail_deposit`,
+`credit_deposit`. A deposit below its policy, a disabled network, a network with
+`min_deposit_units IS NULL` and a network with `required_confirmations = 0` (treated as "no
+confirmation policy configured" — a deliberate strictness) are each refused before any money moves.
+
+### Provider adapter contract
+
+The live path depends on one function, not on a provider:
+`record_provider_deposit(p_event jsonb) returns uuid`. The adapter normalises one provider
+event into one JSON object:
+
+| event key | required | deposits column | rule |
+|---|---|---|---|
+| `network` | yes | `network` | must be registered for (asset, live) in `deposit_networks` |
+| `asset_symbol` | yes | `asset_id` | must exist in `assets` |
+| `user_id` | yes | `user_id` | must exist in `auth.users` |
+| `txid` | yes | `txid` | non-blank, part of the chain key |
+| `amount_units` | yes | `amount_units` | positive whole number of base units |
+| `log_index` | no | `log_index` | default -1 (native transfer) |
+| `confirmations` | no | `confirmations` | default 0; drives pending/confirming/confirmed |
+| `to_address` | no | `address` | recorded as reported, never verified here |
+| `memo` | no | `memo` | required when `deposit_networks.requires_memo` |
+| any extra key | no | `raw` | kept verbatim for audit |
+
+A missing key, a wrong type or a non-object event raises an adapter contract violation
+(`invalid_parameter_value`) and records nothing. The function refuses to run unless
+`app_settings.mode = 'live'`; it then passes the `LIVE_DEPOSITS_ENABLED` gate
+(`app_settings.deposits_enabled`, still **false** in the repo) and the migration-1
+`enforce_environment_gate` trigger. No provider, credential, generated address or
+confirmation source exists in this step — the adapter is not implemented.
+
+### Paper vs live separation
+
+| `source` | `environment` | entry point |
+|---|---|---|
+| `paper_operator` | `paper` | `record_deposit()` — refused while `mode = 'live'` |
+| `provider_adapter` | `live` | `record_provider_deposit()` — refused while `mode <> 'live'` |
+
+`CHECK ((source = 'provider_adapter') = (environment = 'live'))` pins the pairing, so which
+path produced a deposit is visible in the row and the two paths cannot be mixed in either
+direction. Paper deposits are never represented as chain-verified.
+
+### The two deposit switches (owner directive: paper deposits get their own control)
+
+| switch | default | what it gates | refusal message |
+|---|---|---|---|
+| `deposits_enabled` | **false** | the LIVE path only, and only while `mode = 'live'` — the DB side of `LIVE_DEPOSITS_ENABLED`; `enforce_environment_gate` refuses a live row independently | `live deposits are disabled: ...` |
+| `paper_deposits_enabled` | **true** | the PAPER path only: `record_deposit()` and `credit_deposit()` of a paper-environment deposit, via `assert_paper_deposits_enabled()` | `paper deposits are disabled: ...` |
+
+Neither switch can substitute for the other: with the paper switch ON and the exchange in
+paper mode, a live deposit row is still refused, and with the live switch ON the paper
+operator path is still refused outside paper mode. The paper switch defaults ON because paper
+is the non-money sandbox; the live switch defaults OFF because it moves real funds. Both are
+asserted in both directions in the scratch suite (D6 for the live switch, D7 for the paper
+switch, every flip reverted before the suite ends).
+
+**Flagged for the lead:** (1) the paper path is gated by its own switch
+(`paper_deposits_enabled`, default true), not by `deposits_enabled` — that flag is the DB side
+of `LIVE_DEPOSITS_ENABLED` and gates the live path only (both switches asserted in both
+directions in the scratch suite); (2) `required_confirmations = 0` is
+refused as "no policy configured", which is stricter than treating 0 as "credit on sight";
+(3) a confirmed-but-uncredited deposit can still be failed by an operator, but a credited one
+cannot — reversal needs a compensating ledger transaction, out of scope here.
