@@ -474,3 +474,112 @@ directions in the scratch suite); (2) `required_confirmations = 0` is
 refused as "no policy configured", which is stricter than treating 0 as "credit on sight";
 (3) a confirmed-but-uncredited deposit can still be failed by an operator, but a credited one
 cannot — reversal needs a compensating ledger transaction, out of scope here.
+
+## Withdrawal layer (step 7 — status machine, hold/release, fee model, paper vs live)
+
+Migration: `20261005100130_exchange_withdrawals.sql`. Tables: `withdrawal_networks`
+(per asset × network × environment configuration, nothing seeded) and `withdrawal_requests`
+(one row per requested withdrawal). Money only ever moves through the ledger: approval
+posts one `withdrawal_request` hold, completion posts one `withdrawal_settle`, closing posts
+one `withdrawal_refund`. No balance is ever written outside those transactions.
+
+### Status mapping (owner-facing statuses → database state)
+
+| owner-facing | `withdrawal_requests.status` | notes |
+|---|---|---|
+| requested | `pending` | created by `record_withdrawal_request()` (paper) or `record_provider_withdrawal()` (live) |
+| under review | `under review` | operator hold, `review_reason` mandatory |
+| approved (queued) | `approved` | the hold is placed here — funds are locked at approval, not at broadcast |
+| broadcasting / sent | `processing` | `provider_txid` is required to enter it and is recorded on the row |
+| completed | `completed` | settled: `settled_ledger_transaction_id` + `completed_at` set |
+| failed | `failed` | terminal, reason mandatory, hold released |
+| rejected | `rejected` | terminal, reason mandatory, hold released |
+
+### State machine (enforced by the `withdrawal_requests_before_update` trigger)
+
+```
+pending ──► under review ──► approved ──► processing ──► completed
+   │             │              │             │
+   └─────────────┴──► rejected  └────► failed ◄┘
+```
+* `pending → under review → approved → processing → completed` is the only forward path;
+  skipping `processing` is refused (`approved → completed` raises through the entry point).
+* Only `pending` / `under review` can become `rejected`. From `approved` / `processing` the
+  only closing edge is `failed` — a broadcast that already went out is a FAILURE, not a
+  rejection. `reject_withdrawal()` therefore refuses an approved/processing row (its
+  COMMENT says so and points at `fail_withdrawal()`).
+* `completed`, `failed`, `rejected` are terminal: no status change, no edit of the
+  settlement/hold/release pointers, no edit of amount/destination (row identity).
+* Timestamp columns record *when things happened*, so the CHECKs are one-directional on
+  purpose: a row in `approved/processing/completed` MUST carry `approved_at`; a row in
+  `processing/completed` MUST carry `processing_at`; a row in `failed/rejected` MUST carry
+  `closed_at`. A closed row KEEPS `approved_at`/`processing_at` as audit facts — the first,
+  bidirectional form of `withdrawal_requests_approved_at_check` and
+  `withdrawal_requests_processing_at_check` made closing an approved (or broadcast) request
+  impossible, which is what this step fixed.
+
+### Fee model
+
+`fee = withdrawal_fee_flat_units + floor(amount_units × withdrawal_fee_rate_bps / 10000)`,
+in integer base units, charged **on top** of the amount (the user needs amount + fee).
+One implementation — `_withdrawal_fee_units()` — with `quote_withdrawal_fee(asset, network,
+amount)` as the read-only wrapper clients may call (authenticated). The fee is
+**snapshotted** into `withdrawal_requests.fee_units` at creation, so reconfiguring a network
+never changes an existing request. `min_withdrawal_units` / `max_withdrawal_units` bound the
+REQUESTED amount, not amount + fee, and are NOT NULL (a network cannot be registered without
+limits). Worked examples from the suite: BTC paper (flat 1000, 50 bps) → 1,000,000 units
+costs 1000 + 5000 = **6000**; the live BTC registration mirrors it, so a 100,000-unit live
+event costs 1000 + floor(500) = **1500**; SOL (flat 5000, 10 bps) → 50,000 units = 5050.
+
+### Settlement and release postings
+
+* approval: `withdrawal_request` — available −(amount+fee) → locked +(amount+fee).
+* completion: `withdrawal_settle` — locked −(amount+fee), `WITHDRAWAL_CLEARING` +amount,
+  `FEE_INCOME` +fee (fee posting omitted when the fee is 0). One transaction, zero sum.
+* failure/rejection: `withdrawal_refund` — locked −(amount+fee) → available +(amount+fee),
+  recorded in `released_ledger_transaction_id`. A request that was never approved releases
+  nothing. The `withdrawal_release` type does not exist in the ledger's CHECK, so the release
+  posts as `withdrawal_refund` and says what it is in description/metadata (flagged).
+
+### The two withdrawal switches (per-mode, both tested in both directions)
+
+| switch | gates | default |
+|---|---|---|
+| `app_settings.withdrawals_enabled` + `mode = 'live'` | live requests through the provider adapter (`assert_withdrawals_enabled()`) and any live row (`enforce_environment_gate` trigger) | `false` |
+| `app_settings.paper_withdrawals_enabled` | paper request creation, paper approval (holding money), paper settlement | `true` |
+
+Deliberate: neither switch gates `fail_withdrawal()` / `reject_withdrawal()`, so switching a
+mode off can never trap funds that are already locked. Both switches are flipped only in
+scratch databases in the suite and reverted there (`W8`, `W8b`, `W8c`, `W11`).
+
+### Provider adapter contract (live path)
+
+`record_provider_withdrawal(p_event jsonb) RETURNS uuid` — the only live entry point. Required
+keys `network`, `asset_symbol`, `user_id`, `destination_address`, `amount_units`; optional
+`destination_tag`, `memo`, `provider_txid`; any extra provider fields are preserved verbatim
+in `withdrawal_requests.raw`. A malformed event is refused as an adapter contract violation
+and NOTHING is recorded. The row is always `source = provider_adapter`, `environment = 'live'`
+(pinned by CHECK), and the live network row must have been registered in the LIVE environment
+(`register_withdrawal_network()` writes to the current `app_mode()`). The adapter itself —
+broadcasting, signing, key management, polling, confirmations — is NOT implemented in this step.
+
+### Flagged decisions (owner)
+
+1. Destination whitelisting / per-chain address validation / travel rule: not implemented.
+   The destination is only checked non-blank, no whitespace, 4–200 chars, and the
+   (asset, network) pair must be registered. The `under review` state is the hold hook it
+   will need.
+2. Release ledger type: releases post as `withdrawal_refund` (no `withdrawal_release` type).
+3. Reversal of a settled withdrawal: not implemented — it needs a compensating ledger
+   transaction; `fail_withdrawal()` refuses a settled row instead of silently reversing.
+4. Custody model (networks, hot/cold) and fee accounting beyond `FEE_INCOME` (network fee vs
+   service fee split) are open — see the plan's open decisions 2 and 4.
+
+### Verification status
+
+`tests/exchange_withdrawal_tests.sql` runs last in the shared scratch core database:
+**181/181 PASS, 0 FAIL** (run 5, `tests/run_scratch_suites.sh`, runner exit 0) covering the
+network configuration, fee model and rounding, request validation, holds, the state machine,
+settlement and provider-txid idempotency, the release paths, both switches in both
+directions, the adapter contract, the anon/authenticated/service_role matrix, and the
+end-of-suite settings snapshot. Nothing here has been applied to the live Supabase project.
