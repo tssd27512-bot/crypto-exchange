@@ -415,7 +415,13 @@ select public.w_expect('W6 ... zero-sum per asset after the settlement (BTC entr
           join public.assets a on a.id = e.asset_id
          where a.symbol = 'BTC'
            and e.transaction_id = (select settled_ledger_transaction_id from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0001')$q$, '0');
-select public.w_expect('W6 ... the withdrawal clearing account carries exactly the amount that left (1,000,000) and FEE_INCOME the fee (6,000)',
+-- The fee on this request was SNAPSHOTTED at creation from the paper BTC config registered
+-- in W1: withdrawal_fee_flat_units = 1000, withdrawal_fee_rate_bps = 50, so
+-- fee = 1000 + floor(1,000,000 * 50 / 10000) = 1000 + 5000 = 6000 (see _withdrawal_fee_units).
+-- The settlement posts amount to WITHDRAWAL_CLEARING and fee to FEE_INCOME, so the expected
+-- split is exactly 1000000/6000 — the earlier expectation of 1000 (flat only) dated from a
+-- fixture where the proportional leg was 0; the engine's 6000 is the correct number.
+select public.w_expect('W6 ... the withdrawal clearing account carries exactly the amount that left (1,000,000) and FEE_INCOME the fee (6,000 = 1000 flat + 5000 rate)',
   $q$select (select b.available_units::text from public.accounts a join public.balances b on b.account_id = a.id
               where a.code = 'WITHDRAWAL_CLEARING' and a.environment = 'paper'
                 and a.asset_id = (select id from public.assets where symbol = 'BTC'))
@@ -423,13 +429,13 @@ select public.w_expect('W6 ... the withdrawal clearing account carries exactly t
           (select b.available_units::text from public.accounts a join public.balances b on b.account_id = a.id
               where a.code = 'FEE_INCOME' and a.environment = 'paper'
                 and a.asset_id = (select id from public.assets where symbol = 'BTC'))$q$,
-  '1000000/1000');
+  '1000000/6000');
 select public.w_expect('W6 ... the BTC locked balance is back to 0 (the hold was consumed, not stranded)',
   $q$select split_part(public.w_bal('33333333-3333-3333-3333-333333333333', 'BTC'), '/', 2)$q$, '0');
 select public.w_expect_error('W6 completing the same withdrawal twice is refused by the explicit guard',
   $q$select public.complete_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0001'))$q$,
   'already settled');
-select public.w_expect('W6 ... the FEE_INCOME credit is still 1000 (flat 1000 only: this fixture math is asserted precisely)',
+select public.w_expect('W6 ... the FEE_INCOME account has exactly one entry for BTC: the settlement posted the fee once',
   $q$select count(*)::text from public.ledger_entries e
           join public.accounts a on a.id = e.account_id
          where a.code = 'FEE_INCOME' and a.asset_id = (select id from public.assets where symbol = 'BTC')$q$, '1');
@@ -497,7 +503,9 @@ select public.w_expect('W7 ... the release is one balanced withdrawal_refund tra
          group by lt.type$q$, 'withdrawal_refund/2/0');
 select public.w_expect('W7 ... the SOL balances are exactly where they started: 10,000,000,000 available and 0 locked (no stranded funds)',
   $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'SOL')$q$, '10000000000/0');
-select public.w_expect('W7 a failed withdrawal cannot be approved afterwards',
+-- approve_withdrawal() on a failed row is a refusal (an exception), so this must be
+-- w_expect_error: w_expect reports the exception as a FAIL instead of matching the message.
+select public.w_expect_error('W7 a failed withdrawal cannot be approved afterwards',
   $q$select public.approve_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'))$q$,
   'only a pending or under-review withdrawal can be approved');
 select public.w_expect_error('W7 a failed withdrawal cannot be closed again',
@@ -517,6 +525,19 @@ select public.w_expect('W7 ... failed with release recorded and the BTC locked b
   'failed/98989985/0');
 select public.w_expect('W7 ... failed settled nothing (no settlement pointer)',
   $q$select (settled_ledger_transaction_id is null)::text from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0003'$q$, 'true');
+-- Direction probe for withdrawal_requests_processing_at_check (W5-style): the check is
+-- one-directional, so a row that was broadcast and then closed KEEPS processing_at as an
+-- audit fact. The bidirectional form made this close impossible (rare check violation).
+-- The reverse direction is covered by the constraint being one-way on purpose: a closed
+-- row is allowed to hold the timestamp, a processing row is not allowed to miss it.
+select public.w_expect('W7 ... the closed row KEEPS processing_at (closing never erases when the broadcast started)',
+  $q$select status || '/' || (processing_at is not null)::text || '/' || (approved_at is not null)::text
+          from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0003'$q$,
+  'failed/true/true');
+select public.w_expect('W7 ... while a row that never reached processing carries no processing_at',
+  $q$select status || '/' || (processing_at is null)::text
+          from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'$q$,
+  'failed/true');
 select public.w_expect('W7 the user has no stranded locked funds in any asset after the release paths',
   $q$select coalesce(sum(b.locked_units), 0)::text from public.balances b
           join public.accounts a on a.id = b.account_id
@@ -568,6 +589,14 @@ select public.w_run('W8 with the switch back ON the same paper request is accept
 -- pre-existing constraint. withdrawals_enabled stays FALSE: that is the gate under test.
 select public.w_run('W8b go to live mode with withdrawals_enabled still FALSE (scratch database only)',
   $q$update public.app_settings set mode = 'live', live_trading_enabled = true, live_enabled_at = now()$q$);
+-- The live path needs its OWN network row: register_withdrawal_network() writes to the
+-- current environment (app_mode()), so W1 registered paper rows only and every live event
+-- died on "not a registered withdrawal network for BTC in live". Same pattern as the
+-- deposit suite (D6), which registers its live network after switching the mode. The live
+-- BTC config MIRRORS the paper one (flat 1000 + 50 bps, min 1000, max 100000000) so the two
+-- paths cannot drift apart; the W8c cleanup removes it again.
+select public.w_run('W8b register the BTC network in the live environment (mirrors the paper config)',
+  $q$select public.register_withdrawal_network('BTC', 'bitcoin', 1000, 100000000, 1000, 50, false, 0, true)$q$);
 select public.w_expect('W8b live mode reads back with the live withdrawal flag off',
   $q$select mode || '/' || withdrawals_enabled::text || '/' || paper_withdrawals_enabled::text from public.app_settings$q$,
   'live/false/true');
@@ -593,7 +622,12 @@ select public.w_run('W8b the adapter path is accepted with the live gate open',
 select public.w_expect('W8b ... it is a provider_adapter row in the live environment, pending, fee from the live network config',
   $q$select environment || '/' || source || '/' || status || '/' || fee_units::text
           from public.withdrawal_requests where destination_address = 'TESTFIXTURELIVEADDR5'$q$,
-  'live/provider_adapter/pending/6000');
+  'live/provider_adapter/pending/1500');
+-- The fee expectation above is arithmetic, not a guess: the live BTC row registered in W8b
+-- carries withdrawal_fee_flat_units = 1000 and withdrawal_fee_rate_bps = 50, so
+-- _withdrawal_fee_units(100000) = 1000 + floor(100000 * 50 / 10000) = 1000 + 500 = 1500.
+-- (The earlier 6000 was copied from the paper fixture's 1,000,000-unit request, where the
+-- same formula gives 1000 + 5000; the amount here is 100,000, so 1500 is the correct value.)
 select public.w_expect('W8b the source/environment pairing is intact after every probe',
   $q$select count(*)::text from public.withdrawal_requests where (source = 'provider_adapter') <> (environment = 'live')$q$, '0');
 
@@ -641,6 +675,15 @@ select public.w_expect('W9 ... and the txid the adapter reported is on the row',
 select public.w_run('W8c back to paper mode, live trading and live withdrawal flags off',
   $q$update public.app_settings set mode = 'paper', live_trading_enabled = false, live_enabled_at = null, withdrawals_enabled = false$q$);
 select public.w_run('W8c paper withdrawals on', $q$update public.app_settings set paper_withdrawals_enabled = true$q$);
+-- Remove the live fixture again (as the deposit suite does in D6): the live probe rows and
+-- the live BTC network registration W8b added. W10/W11 assert on the paper configuration
+-- (5 networks, one disabled), so the live rows must not leak past W9.
+select public.w_run('W8c remove the live probe rows and the live network registration (scratch fixture cleanup)',
+  $q$delete from public.withdrawal_requests where environment = 'live';
+     delete from public.withdrawal_networks where environment = 'live'$q$);
+select public.w_expect('W8c ... no live withdrawal row and no live network row survived the probes',
+  $q$select (select count(*) from public.withdrawal_requests where environment = 'live')::text || '/' ||
+           (select count(*) from public.withdrawal_networks where environment = 'live')::text$q$, '0/0');
 -- record_provider_withdrawal lives in the function ACL set: a refusal here is an
 -- exception, so this is w_expect_error (w_expect would report the exception as a FAIL).
 select public.w_expect_error('W8c the gates are closed again: the adapter path is refused in paper mode',
@@ -717,10 +760,18 @@ select public.w_expect('W11 the live flags are all off and the mode is paper, ex
           from public.app_settings$q$, 'paper/false/false/false');
 select public.w_expect('W11 the fee/limit configuration of every network ended as registered (5 networks, one disabled)',
   $q$select count(*)::text || '/' || count(*) filter (where not withdrawal_enabled)::text from public.withdrawal_networks$q$, '5/1');
-select public.w_expect('W11 every user''s locked balance is 0 after the whole suite (no stranded holds)',
+-- Scoped to THIS suite's three users on purpose: the core database is shared with
+-- exchange_schema_tests.sql, which leaves a 60,000-unit locked hold open on its own fixture
+-- user 1111… (an unfilled order that exchange_immutability_rls_probe.sql then exercises).
+-- A database-wide "locked = 0" therefore asserted somebody else's fixture, not a stranded
+-- withdrawal hold — the whole point of this line is that no WITHDRAWAL hold leaked.
+select public.w_expect('W11 every withdrawal user''s locked balance is 0 after the whole suite (no stranded holds)',
   $q$select coalesce(sum(b.locked_units), 0)::text from public.balances b
           join public.accounts a on a.id = b.account_id
-         where a.account_type = 'user'$q$, '0');
+         where a.account_type = 'user'
+           and a.user_id in ('33333333-3333-3333-3333-333333333333',
+                             '44444444-4444-4444-4444-444444444444',
+                             '55555555-5555-5555-5555-555555555555')$q$, '0');
 
 \echo '=== SUMMARY'
 select 'SUMMARY total=' || count(*) || ' pass=' || count(*) filter (where ok)

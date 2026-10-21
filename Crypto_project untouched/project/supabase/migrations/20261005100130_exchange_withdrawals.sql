@@ -298,8 +298,12 @@ CREATE TABLE IF NOT EXISTS public.withdrawal_requests (
   CONSTRAINT withdrawal_requests_approved_at_check CHECK (
     status NOT IN ('approved', 'processing', 'completed') OR approved_at IS NOT NULL
   ),
+  -- one-directional for the same reason as approved_at above: a request that was
+  -- broadcast and then failed keeps processing_at as an audit fact (closing must never
+  -- have to erase when the chain broadcast started). Only start_withdrawal_processing()
+  -- and complete_withdrawal() write processing_at, so nothing else can invent it.
   CONSTRAINT withdrawal_requests_processing_at_check CHECK (
-    (status IN ('processing', 'completed')) = (processing_at IS NOT NULL)
+    status NOT IN ('processing', 'completed') OR processing_at IS NOT NULL
   ),
   CONSTRAINT withdrawal_requests_completed_at_check CHECK (
     (status = 'completed') = (completed_at IS NOT NULL)
@@ -1296,7 +1300,7 @@ BEGIN
 END $$;
 
 COMMENT ON FUNCTION public.reject_withdrawal(uuid, text) IS
-  'Operator path: refuse a pending, under-review, approved or processing withdrawal (status rejected, mandatory reason). Any hold is released back to available exactly. Not gated by the paper sandbox switch, so funds can never be trapped. service_role only.';
+  'Operator path: refuse a pending or under-review withdrawal (status rejected, mandatory reason) and release any hold back to available exactly. From approved/processing the state machine only allows fail_withdrawal(): a broadcast that already went out is a FAILURE, not a rejection, so use fail_withdrawal() there (the before-update trigger refuses approved -> rejected). Not gated by the paper sandbox switch, so funds can never be trapped. service_role only.';
 
 CREATE OR REPLACE FUNCTION public.fail_withdrawal(
   p_withdrawal_id uuid,
