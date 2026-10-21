@@ -292,8 +292,11 @@ CREATE TABLE IF NOT EXISTS public.withdrawal_requests (
     OR hold_ledger_transaction_id IS NULL
     OR released_ledger_transaction_id IS NOT NULL
   ),
+  -- one-directional on purpose: an approved/processing/completed row MUST carry
+  -- approved_at; a failed/rejected row that was approved keeps it as an audit fact
+  -- (the first, bidirectional form made closing an approved withdrawal impossible).
   CONSTRAINT withdrawal_requests_approved_at_check CHECK (
-    (status IN ('approved', 'processing', 'completed')) = (approved_at IS NOT NULL)
+    status NOT IN ('approved', 'processing', 'completed') OR approved_at IS NOT NULL
   ),
   CONSTRAINT withdrawal_requests_processing_at_check CHECK (
     (status IN ('processing', 'completed')) = (processing_at IS NOT NULL)

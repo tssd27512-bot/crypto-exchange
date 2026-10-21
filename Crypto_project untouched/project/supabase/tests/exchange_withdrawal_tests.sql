@@ -641,8 +641,11 @@ select public.w_expect('W9 ... and the txid the adapter reported is on the row',
 select public.w_run('W8c back to paper mode, live trading and live withdrawal flags off',
   $q$update public.app_settings set mode = 'paper', live_trading_enabled = false, live_enabled_at = null, withdrawals_enabled = false$q$);
 select public.w_run('W8c paper withdrawals on', $q$update public.app_settings set paper_withdrawals_enabled = true$q$);
-select public.w_expect('W8c the gates are closed again: the adapter path is refused in paper mode',
-  $q$select public.record_provider_withdrawal('{"network":"bitcoin","asset_symbol":"BTC","user_id":"33333333-3333-3333-3333-333333333333","destination_address":"TESTFIXTURELIVEADDR8","amount_units":100000}'::jsonb)$q$, null);
+-- record_provider_withdrawal lives in the function ACL set: a refusal here is an
+-- exception, so this is w_expect_error (w_expect would report the exception as a FAIL).
+select public.w_expect_error('W8c the gates are closed again: the adapter path is refused in paper mode',
+  $q$select public.record_provider_withdrawal('{"network":"bitcoin","asset_symbol":"BTC","user_id":"33333333-3333-3333-3333-333333333333","destination_address":"TESTFIXTURELIVEADDR8","amount_units":100000}'::jsonb)$q$,
+  'live-only');
 
 \echo '=== W10. authz matrix'
 select public.w_expect_error('W10 anon cannot read withdrawal_requests at all (no privilege)',
