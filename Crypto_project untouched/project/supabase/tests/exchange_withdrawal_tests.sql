@@ -114,11 +114,14 @@ end;
 $fn$;
 
 -- 'available/locked' for one user/asset in the current environment (paper)
+-- Each figure is summed over its OWN account kind (FILTER), never across both: the
+-- first version put the two kinds in one CASE inside one sum and reported
+-- available+locked as "available" with a locked figure of 0.
 create or replace function public.w_bal(p_user uuid, p_symbol text, p_env text default 'paper')
 returns text language sql stable as $fn$
-  select coalesce(sum(case when a.kind = 'available' then b.available_units else b.locked_units end), 0)::text
+  select coalesce(sum(b.available_units) filter (where a.kind = 'available'), 0)::text
          || '/' ||
-         coalesce(sum(case when a.kind = 'available' then b.locked_units else b.available_units end), 0)::text
+         coalesce(sum(b.locked_units) filter (where a.kind = 'locked'), 0)::text
     from public.accounts a
     left join public.balances b on b.account_id = a.id
    where a.user_id = p_user and a.environment = p_env
@@ -147,7 +150,10 @@ end $fn$;
 -- fixtures: two users of this suite's own (the schema suite's 1111…/2222… are untouched)
 insert into auth.users (id, email) values
   ('33333333-3333-3333-3333-333333333333', 'wd-u1@scratch.test'),
-  ('44444444-4444-4444-4444-444444444444', 'wd-u2@scratch.test')
+  ('44444444-4444-4444-4444-444444444444', 'wd-u2@scratch.test'),
+  -- u3 exists only for the W10 probe "a signed-in user with no withdrawals sees none":
+  -- u2 cannot serve it, it owns the rejected USDT request created in W4.
+  ('55555555-5555-5555-5555-555555555555', 'wd-u3@scratch.test')
 on conflict (id) do nothing;
 \set U1 '33333333-3333-3333-3333-333333333333'
 \set U2 '44444444-4444-4444-4444-444444444444'
@@ -266,8 +272,10 @@ select public.w_expect('W3 ... and nothing is locked and no ledger transaction w
                and lt.reference_id = (select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0001'))::text
           from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0001'$q$,
   'true/0');
-select public.w_expect('W3 the fee snapshot does not follow a later configuration change',
-  $q$select public.register_withdrawal_network('BTC', 'bitcoin', 1000, 100000000, 2000, 100, false, 0, true)$q$, null);
+-- register_withdrawal_network() RETURNS uuid, so this is a fixture step (w_run), not a
+-- value assertion: the two w_expect lines below are what pin the snapshot.
+select public.w_run('W3 change the BTC fee model (the request must keep its snapshot)',
+  $q$select public.register_withdrawal_network('BTC', 'bitcoin', 1000, 100000000, 2000, 100, false, 0, true)$q$);
 select public.w_expect('W3 ... the existing request still carries its 6000-unit fee',
   $q$select fee_units::text from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0001'$q$, '6000');
 select public.w_expect('W3 ... while a new request would be quoted with the new fee (2000 + 100 bps)',
@@ -330,7 +338,7 @@ select public.w_run('W4 approve out of review',
 select public.w_expect('W4 ... SOL: 10000 flat+rate fee on 100000 (5000 + 100) locked on top',
   $q$select status || '/' || fee_units::text || '/' || public.w_bal('33333333-3333-3333-3333-333333333333', 'SOL')
           from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'$q$,
-  'approved/5100/999994900/105100');
+  'approved/5100/9999894900/105100');
 
 \echo '=== W5. the state machine: every illegal transition refused'
 select public.w_run('W5 create one request per status for the transition probes',
@@ -362,9 +370,13 @@ select public.w_expect_error('W5 the identity of a request is immutable (amount)
 select public.w_expect_error('W5 the identity of a request is immutable (destination)',
   $q$update public.withdrawal_requests set destination_address = 'TESTFIXTURESTATE0002'
       where destination_address = 'TESTFIXTURESTATE0001'; select 'updated'$q$, 'identity of withdrawal');
+-- The status/approved_at pair is a CHECK, not a trigger rule: it only bites on a row
+-- whose status is approved/processing/completed. TESTFIXTURESTATE0001 is pending
+-- (approved_at is already NULL there), so the probe must target the APPROVED fixture.
 select public.w_expect_error('W5 the terminal-status timestamp pair is enforced by CHECK (approved without approved_at is impossible)',
   $q$update public.withdrawal_requests set approved_at = null
-      where destination_address = 'TESTFIXTURESTATE0001'; select 'updated'$q$, 'immutable');
+      where destination_address = 'TESTFIXTUREBTCADDR0001'; select 'updated'$q$,
+  'withdrawal_requests_approved_at_check');
 select public.w_expect('W5 the state/transition probes left both requests untouched',
   $q$select string_agg(status, ',' order by destination_address) from public.withdrawal_requests
          where destination_address in ('TESTFIXTURESTATE0001', 'TESTFIXTUREBTCADDR0001')$q$,
@@ -456,22 +468,26 @@ select public.w_expect('W6b two settled withdrawals, two distinct provider txids
           from public.withdrawal_requests where status = 'completed'$q$, '2/2/1003000');
 
 \echo '=== W7. failure / rejection release EXACTLY the hold'
-select public.w_expect('W7 user 1 BTC: 98,994,000 available, 1,006,000 locked -> 1,003,000 locked after clearing',
-  $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'BTC')$q$, '98994000/0');
+-- 100,000,000 funded - 1,006,000 (BTCADDR0001, completed in W6)
+-- - 4,015 (BTCADDR0002: 3,000 + 1,000 flat + 15 bps, completed in W6b) = 98,989,985
+select public.w_expect('W7 user 1 BTC: 98,989,985 available, nothing locked after both settlements',
+  $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'BTC')$q$, '98989985/0');
 select public.w_expect_error('W7 closing a request as something other than failed/rejected is refused',
   $q$select public._withdrawal_close((select id from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'), 'approved', 'x')$q$,
   'only failed and rejected close a request');
 select public.w_expect_error('W7 closing a request without a reason is refused',
   $q$select public.reject_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'), '  ')$q$,
   'requires a reason');
-select public.w_expect('W7 SOL before the rejection: 9,999,949,000 available / 105,100 locked',
-  $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'SOL')$q$, '9999949000/105100');
-select public.w_run('W7 reject the approved SOL request',
-  $q$select public.reject_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'), 'destination not whitelisted yet')$q$);
-select public.w_expect('W7 ... rejected with its reason, release recorded, closed_at set',
+select public.w_expect('W7 SOL before the release: 9,999,894,900 available / 105,100 locked',
+  $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'SOL')$q$, '9999894900/105100');
+-- approved -> failed is the only closing edge out of 'approved' (pending/under review
+-- close as rejected); both share the same release path, which is what W7 measures.
+select public.w_run('W7 fail the approved SOL request (releases the hold)',
+  $q$select public.fail_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'), 'destination not whitelisted yet')$q$);
+select public.w_expect('W7 ... failed with its reason, release recorded, closed_at set',
   $q$select status || '/' || failure_reason || '/' || (released_ledger_transaction_id is not null)::text || '/' || (closed_at is not null)::text
           from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'$q$,
-  'rejected/destination not whitelisted yet/true/true');
+  'failed/destination not whitelisted yet/true/true');
 select public.w_expect('W7 ... the release is one balanced withdrawal_refund transaction (2 postings, zero sum)',
   $q$select lt.type || '/' || count(*)::text || '/' || sum(e.amount_units)::text
           from public.withdrawal_requests w
@@ -481,10 +497,10 @@ select public.w_expect('W7 ... the release is one balanced withdrawal_refund tra
          group by lt.type$q$, 'withdrawal_refund/2/0');
 select public.w_expect('W7 ... the SOL balances are exactly where they started: 10,000,000,000 available and 0 locked (no stranded funds)',
   $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'SOL')$q$, '10000000000/0');
-select public.w_expect_error('W7 a rejected withdrawal cannot be approved afterwards',
+select public.w_expect('W7 a failed withdrawal cannot be approved afterwards',
   $q$select public.approve_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'))$q$,
   'only a pending or under-review withdrawal can be approved');
-select public.w_expect_error('W7 a rejected withdrawal cannot be closed again',
+select public.w_expect_error('W7 a failed withdrawal cannot be closed again',
   $q$select public.fail_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTURESOLADDR0001'), 'again')$q$,
   'terminal');
 
@@ -498,7 +514,7 @@ select public.w_run('W7 ... fail it', $q$select public.fail_withdrawal((select i
 select public.w_expect('W7 ... failed with release recorded and the BTC locked balance back to 0',
   $q$select status || '/' || public.w_bal('33333333-3333-3333-3333-333333333333', 'BTC')
           from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0003'$q$,
-  'failed/98994000/0');
+  'failed/98989985/0');
 select public.w_expect('W7 ... failed settled nothing (no settlement pointer)',
   $q$select (settled_ledger_transaction_id is null)::text from public.withdrawal_requests where destination_address = 'TESTFIXTUREBTCADDR0003'$q$, 'true');
 select public.w_expect('W7 the user has no stranded locked funds in any asset after the release paths',
@@ -527,10 +543,10 @@ select public.w_expect_error('W8 paper request recording is refused while the pa
 select public.w_expect_error('W8 paper approval (which would hold money) is refused while the paper switch is off',
   $q$select public.approve_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREGATE0001'))$q$,
   'paper withdrawals are disabled');
-select public.w_run('W8 the release path is NOT gated: the approved request can still be rejected while the switch is off',
-  $q$select public.reject_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREGATE0002'), 'released while paper switch is off')$q$);
+select public.w_run('W8 the release path is NOT gated: the approved request can still be failed while the switch is off',
+  $q$select public.fail_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREGATE0002'), 'released while paper switch is off')$q$);
 select public.w_expect('W8 ... and its hold was released exactly (locked back to 0)',
-  $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'BTC')$q$, '98994000/0');
+  $q$select public.w_bal('33333333-3333-3333-3333-333333333333', 'BTC')$q$, '98989985/0');
 select public.w_expect_error('W8 the live adapter path is still refused while the exchange is in paper mode (the paper flag changes nothing there)',
   $q$select public.record_provider_withdrawal('{"network":"bitcoin","asset_symbol":"BTC","user_id":"33333333-3333-3333-3333-333333333333","destination_address":"TESTFIXTURELIVEADDR1","amount_units":100000}'::jsonb)$q$,
   'live-only');
@@ -547,8 +563,11 @@ select public.w_run('W8 with the switch back ON the same paper request is accept
   $q$select public.record_withdrawal_request('33333333-3333-3333-3333-333333333333', 'BTC', 'bitcoin', 'TESTFIXTUREGATE0004', 5000)$q$);
 
 \echo '=== W8b. live mode: mode = live and withdrawals_enabled'
+-- app_settings_live_gate_check (migration 1) only allows mode='live' together with
+-- live_trading_enabled AND live_enabled_at, so entering live mode has to satisfy that
+-- pre-existing constraint. withdrawals_enabled stays FALSE: that is the gate under test.
 select public.w_run('W8b go to live mode with withdrawals_enabled still FALSE (scratch database only)',
-  $q$update public.app_settings set mode = 'live'$q$);
+  $q$update public.app_settings set mode = 'live', live_trading_enabled = true, live_enabled_at = now()$q$);
 select public.w_expect('W8b live mode reads back with the live withdrawal flag off',
   $q$select mode || '/' || withdrawals_enabled::text || '/' || paper_withdrawals_enabled::text from public.app_settings$q$,
   'live/false/true');
@@ -590,7 +609,7 @@ select public.w_expect_error('W9 a JSON string is refused',
 select public.w_expect_error('W9 missing required keys are refused and named',
   $q$select public.record_provider_withdrawal('{"network":"bitcoin","asset_symbol":"BTC"}
      '::jsonb || '{"user_id":"33333333-3333-3333-3333-333333333333"}'::jsonb)$q$,
-  'missing required key(s) destination_address, amount_units');
+  'missing required key(s) amount_units, destination_address');
 select public.w_expect_error('W9 a non-uuid user_id is refused',
   $q$select public.record_provider_withdrawal('{"network":"bitcoin","asset_symbol":"BTC","user_id":"not-a-uuid","destination_address":"TESTFIXTURELIVEADDR6","amount_units":100000}'::jsonb)$q$,
   'user_id is not a uuid');
@@ -619,7 +638,8 @@ select public.w_expect('W9 ... and the txid the adapter reported is on the row',
   'TESTFIXTURELIVETX0001/pending');
 
 \echo '=== W8c. revert every flag flip'
-select public.w_run('W8c back to paper mode, live withdrawal flag off', $q$update public.app_settings set mode = 'paper', withdrawals_enabled = false$q$);
+select public.w_run('W8c back to paper mode, live trading and live withdrawal flags off',
+  $q$update public.app_settings set mode = 'paper', live_trading_enabled = false, live_enabled_at = null, withdrawals_enabled = false$q$);
 select public.w_run('W8c paper withdrawals on', $q$update public.app_settings set paper_withdrawals_enabled = true$q$);
 select public.w_expect('W8c the gates are closed again: the adapter path is refused in paper mode',
   $q$select public.record_provider_withdrawal('{"network":"bitcoin","asset_symbol":"BTC","user_id":"33333333-3333-3333-3333-333333333333","destination_address":"TESTFIXTURELIVEADDR8","amount_units":100000}'::jsonb)$q$, null);
@@ -642,12 +662,12 @@ select public.w_expect('W10 a signed-in user sees exactly their own withdrawal r
   $q$select count(*)::text from public.withdrawal_requests$q$,
   (select count(*)::text from public.withdrawal_requests where user_id = '33333333-3333-3333-3333-333333333333'),
   'authenticated', '33333333-3333-3333-3333-333333333333'::uuid);
-select public.w_expect('W10 ... and none of another user''s (user 2 has none after the W4 rejection)',
+select public.w_expect('W10 ... and none of another user''s (user 2''s rejected W4 request is invisible to user 1)',
   $q$select count(*)::text from public.withdrawal_requests where user_id = '44444444-4444-4444-4444-444444444444'$q$, '0',
   'authenticated', '33333333-3333-3333-3333-333333333333'::uuid);
 select public.w_expect('W10 a signed-in user with no withdrawals sees none',
   $q$select count(*)::text from public.withdrawal_requests$q$, '0',
-  'authenticated', '44444444-4444-4444-4444-444444444444'::uuid);
+  'authenticated', '55555555-5555-5555-5555-555555555555'::uuid);
 select public.w_expect('W10 a signed-in user can read the withdrawal network configuration',
   $q$select count(*)::text from public.withdrawal_networks$q$, '5', 'authenticated', '33333333-3333-3333-3333-333333333333'::uuid);
 select public.w_expect_error('W10 a signed-in user cannot insert a withdrawal row',
@@ -669,13 +689,17 @@ select public.w_expect('W10 service_role reads the whole table (RLS bypassed)',
 select public.w_expect('W10 service_role can execute the operator transitions',
   $q$select public.approve_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREGATE0001'))$q$,
   'approved', 'service_role');
+-- client roles only: the table owner (postgres) keeps its owner privileges, which no
+-- client can ever use.
 select public.w_expect('W10 no DELETE privilege exists for any client role',
   $q$select count(*)::text from information_schema.role_table_grants
-         where table_name in ('withdrawal_requests', 'withdrawal_networks') and privilege_type = 'DELETE'$q$, '0');
+         where table_name in ('withdrawal_requests', 'withdrawal_networks')
+           and privilege_type = 'DELETE'
+           and grantee in ('anon', 'authenticated', 'service_role')$q$, '0');
 
 \echo '=== W11. the settings end where they started'
 select public.w_run('W11 release the one hold W10 left open (its approval was the authz probe)',
-  $q$select public.reject_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREGATE0001'), 'end of suite cleanup')$q$);
+  $q$select public.fail_withdrawal((select id from public.withdrawal_requests where destination_address = 'TESTFIXTUREGATE0001'), 'end of suite cleanup')$q$);
 select public.w_expect('W11 app_settings matches the snapshot taken before this suite ran (mode, every live flag, both paper switches)',
   $q$select s.mode || '/' || s.live_trading_enabled::text || '/' || s.deposits_enabled::text || '/' ||
            s.withdrawals_enabled::text || '/' || s.paper_deposits_enabled::text || '/' ||
