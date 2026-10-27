@@ -287,7 +287,8 @@ select public.k_expect('K4c rejecting again is idempotent',
 select public.k_expect('K4c ... and wrote no extra audit row',
   $q$select public.k_audit('kyc.submission.rejected', public.k_id('K4a')::uuid)$q$, '1');
 select public.k_expect_error('K4d a rejected submission cannot be approved afterwards',
-  $q$select public.approve_kyc(public.k_id('K4a')::uuid)$q$, 'terminal');
+  $q$select public.approve_kyc(public.k_id('K4a')::uuid)$q$,
+  'only a pending or under-review submission can be approved');
 select public.k_expect_error('K4d a rejected submission is immutable',
   $q$with u as (update public.kyc_submissions set decision_reason = 'edited'
                  where id = public.k_id('K4a')::uuid returning 1)
@@ -311,7 +312,8 @@ select public.k_expect('K5a under review -> approved is a legal step',
 select public.k_expect('K5a ... granting user B level 1 after the earlier rejection',
   $q$select public.k_lvl('66666666-6666-6666-6666-666666666602')$q$, '1');
 select public.k_expect_error('K5b a terminal submission cannot go back under review',
-  $q$select public.set_kyc_under_review(public.k_id('K4e')::uuid)$q$, 'terminal');
+  $q$select public.set_kyc_under_review(public.k_id('K4e')::uuid)$q$,
+  'only a pending submission can be put under review');
 select public.k_expect_error('K5c level 0 cannot be applied for (it is the default)',
   $q$select public.submit_kyc('66666666-6666-6666-6666-666666666603', 0)$q$, 'cannot be applied for');
 select public.k_expect_error('K5c an unknown level cannot be applied for',
@@ -345,9 +347,10 @@ select public.k_expect('K6 the level of user A is still 1 after every refused at
 select public.k_keep('K6b', 'K6b submit level 2 for user A (address verification)',
   $q$select public.submit_kyc('66666666-6666-6666-6666-666666666601', 2,
        '{"address_proof_id":"TESTFIXTUREADDR0001"}'::jsonb)::text$q$);
-select public.k_expect('K6b approving level 2 raises the level to 2',
-  $q$select public.approve_kyc(public.k_id('K6b')::uuid) || '/' || public.k_lvl('66666666-6666-6666-6666-666666666601')$q$,
-  'approved/2');
+select public.k_expect('K6b approve the level-2 submission',
+  $q$select public.approve_kyc(public.k_id('K6b')::uuid)$q$, 'approved');
+select public.k_expect('K6b ... raising the level of user A to 2',
+  $q$select public.k_lvl('66666666-6666-6666-6666-666666666601')$q$, '2');
 select public.k_keep('K6c', 'K6c submit level 1 for user A again (below the current level)',
   $q$select public.submit_kyc('66666666-6666-6666-6666-666666666601', 1, '{}'::jsonb)::text$q$);
 select public.k_expect_error('K6c approving a submission below the current level is refused (no downgrade)',
@@ -408,12 +411,13 @@ select public.k_expect('K8b the audit row names the provider adapter as the acto
   $q$select actor_role || '/' || coalesce(actor_id::text,'NULL') from public.security_audit_log
         where action = 'kyc.submission.under_review' and entity_id = public.k_id('K8b')::uuid$q$,
   'provider_adapter/NULL');
-select public.k_expect('K8c an approve event on the same reference approves it and grants level 1',
+select public.k_expect('K8c an approve event on the same reference approves that submission',
   $q$select public.record_provider_kyc_event(jsonb_build_object(
        'event_type','approve','user_id','66666666-6666-6666-6666-666666666603',
-       'submission_reference','TESTFIXTURE-PROV-1','provider','testvendor'))::text
-       || '/' || public.k_lvl('66666666-6666-6666-6666-666666666603')$q$,
-  (select public.k_id('K8b') || '/1'));
+       'submission_reference','TESTFIXTURE-PROV-1','provider','testvendor'))::text$q$,
+  (select public.k_id('K8b')));
+select public.k_expect('K8c ... and grants the user level 1',
+  $q$select public.k_lvl('66666666-6666-6666-6666-666666666603')$q$, '1');
 select public.k_expect('K8c ... and the submission is approved (terminal)',
   $q$select public.k_status('K8b')$q$, 'approved');
 select public.k_expect('K8c ... with the provider recorded on the user''s status',
