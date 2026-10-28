@@ -75,6 +75,7 @@ exits non-zero if any suite is not green, and keeps raw logs in `$LOGDIR` (defau
 | `exchange_ledger_invariant_tests.sql` | exactly 4 `psql ... ERROR` lines (D1-D4 are the pass condition), `NOTICE:  PASS` 5, `NOTICE:  FAIL` 0 |
 | `exchange_immutability_rls_probe.sql` | `NOTICE:  PASS` 56, `NOTICE:  FAIL` 0 — ledger immutability as postgres/authenticated/anon plus the full RLS matrix |
 | `exchange_matching_engine_tests.sql` | `SUMMARY total=63 pass=63 fail=0` |
+| `exchange_kyc_tests.sql` | `SUMMARY total=160 pass=160 fail=0` — the tier model, tier-0 materialisation, both decision paths, the provider-adapter contract, the no-PII guard, the append-only audit log, the authz matrix and the function ACLs |
 
 ## Suite dependencies and gotchas (learned the hard way)
 

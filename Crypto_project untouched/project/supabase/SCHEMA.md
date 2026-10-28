@@ -583,3 +583,160 @@ network configuration, fee model and rounding, request validation, holds, the st
 settlement and provider-txid idempotency, the release paths, both switches in both
 directions, the adapter contract, the anon/authenticated/service_role matrix, and the
 end-of-suite settings snapshot. Nothing here has been applied to the live Supabase project.
+
+## KYC layer (step 8 — tier model, provider-adapter contract, no PII, security audit)
+
+Migration `20261005100140_exchange_kyc_security.sql`. **Provider-agnostic by design:** no vendor
+is integrated, selected or referenced, and no credential, document store or API key exists in
+this repo. Vendor selection is the owner's open decision #1.
+
+**No money path is gated on KYC in this migration.** The money layers (deposits, withdrawals,
+trading) do not read any KYC table; `app_settings.kyc_required_for_trading` still exists,
+still defaults to `false` and is untouched.
+
+### Tier model (`kyc_levels`)
+
+| level | name | meaning |
+|---|---|---|
+| 0 | `unverified` | default for every user; no identity check performed |
+| 1 | `identity` | an identity document was checked by an operator or a provider |
+| 2 | `address` | identity plus proof of address checked |
+
+Reference data only — `(level, name, description)`. **Per-tier limits are deliberately absent:**
+withdrawal caps, deposit caps and trading caps depend on the custody model and the vendor, so
+they are an OWNER decision. There is no limit column, no `limits` jsonb and no implied policy;
+the suite pins this (`K1`).
+
+### Per-user status (`kyc_status`)
+
+One row per user, materialised at level 0 on first reference (`ensure_kyc_status()`, and
+`my_kyc_status()` for a signed-in user). `provider` stays NULL until a vendor is chosen.
+
+The level follows approvals, and that is a **database invariant**, not a convention: the
+`kyc_status_before_update` trigger refuses (a) any level that has no `approved` submission for
+that user and level, (b) any downgrade, (c) any change of owner. So `UPDATE kyc_status SET
+level = 2` by hand fails even for `service_role`.
+
+### Submission state machine (`kyc_submissions`)
+
+```
+pending --> under review --> approved | rejected
+   |                              |
+   +----------> approved | rejected
+approved  --> (terminal)     rejected --> (terminal)
+```
+
+- `pending → approved` (straight through) and `pending → under review → approved` are both
+  allowed, exactly as in the withdrawal layer: **whether review is mandatory (or only above a
+  threshold) is an owner policy decision** and is not invented here.
+- `approved` means the level was granted; `rejected` leaves the level untouched. Both are
+  terminal and immutable (trigger), so **resubmission is always a new row** and the old row
+  stays as evidence.
+- The identity of a row (user, level sought, environment, source) and the provider idempotency
+  pair are immutable; an approved/rejected row refuses every `UPDATE`.
+
+### No personal data in the database (enforced, not just documented)
+
+| stored here | NOT stored here |
+|---|---|
+| opaque references: document id, content hash, vendor applicant id, provider reference | names, dates of birth, e-mail/phone, postal addresses, national ID/passport numbers, documents (images/PDFs/base64), selfies, signatures, bank details |
+
+The document bytes belong to whatever the future vendor stores; **the storage location is part
+of the vendor decision and is deliberately not decided here.** The rule is enforced by
+`_kyc_pii_key_path()` + the `kyc_metadata_guard` trigger, which walks `metadata`/`raw`
+recursively and refuses a denylisted key with the path of the offending field
+(`K7`, `K8e`). A careless operator or adapter cannot turn this table into a PII store.
+
+### Paper vs live: two paths
+
+| source | environment | entry points | who calls it |
+|---|---|---|---|
+| `paper_operator` | `paper` | `submit_kyc()`, `set_kyc_under_review()`, `approve_kyc()`, `reject_kyc()` | operator / test harness, paper only |
+| `provider_adapter` | `live` | `record_provider_kyc_event()` | the live KYC provider adapter |
+
+Pairing is pinned by CHECK and by `assert_kyc_path()` in **both** directions: the operator path
+raises while `app_settings.mode = 'live'`, the adapter path raises unless `mode = 'live'`
+(`K9`). Deliberate: KYC carries no money, so it has **no `app_settings` flag** and the
+`enforce_environment_gate` trigger is NOT attached to these tables (a live KYC row must not
+require live trading). The mode is the only switch, and no `app_settings` column is added.
+
+### Provider adapter contract
+
+`record_provider_kyc_event(p_event jsonb) RETURNS uuid`
+
+```json
+{ "event_type":           "approve | reject | under_review",
+  "user_id":              "<uuid>",
+  "submission_reference": "<vendor submission/applicant id>",
+  "provider":             "<vendor name>",
+  "level_sought":         1,
+  "reason":               "<free text>",
+  "metadata":             { "provider_applicant_ref": "..." } }
+```
+
+Required: `event_type`, `user_id`, `submission_reference`. Optional: `provider`, `level_sought`
+(**required when the event creates the row**), `reason`, `metadata`; any extra provider field is
+preserved verbatim in `raw`. Idempotency is `UNIQUE (provider, provider_reference)` plus an
+explicit guard: replaying a terminal event, or repeating the current status, raises and records
+nothing, so a replayed vendor callback can never grant a second level (`K8d`). A non-object
+event, a missing key, an unknown `event_type`, a non-uuid user id, a blank reference, an
+ambiguous reference, PII in the payload, or a `reject` for an unknown reference is refused as an
+adapter contract violation (`K8e`–`K8g`). The adapter itself — HTTP client, signature
+verification, polling, webhook handling, document upload — is **not** part of this step.
+
+### Security audit log (`security_audit_log`)
+
+Append-only, using the ledger's `reject_mutation` trigger: `UPDATE`/`DELETE` are refused for
+**every** role including the owner, and by privilege for anon/authenticated/service_role (`K10`).
+Columns: `at, actor_role, actor_id (nullable), subject_user_id (nullable), action, entity_type,
+entity_id, details`.
+
+Exactly one row per KYC submission status change and per KYC level change, written by the AFTER
+triggers `kyc_submissions_audit` / `kyc_status_audit` — so **both paths** are audited, including a
+privileged update that bypasses the entry points. A row created already decided (the adapter's
+straight-through approve) writes two rows: `kyc.submission.submitted` and the decision. The actor
+comes from the transaction-local settings `gtvx.actor_role` / `gtvx.actor_id` set by the entry
+points (`operator`, `provider_adapter`, else `system`). **`actor_id` is NULL on the operator path
+because no operator identity system exists yet** — that is step 9 (admin/operator controls), and
+it is flagged rather than faked.
+
+Users read their own rows (`subject_user_id = auth.uid()`); `service_role` reads all; anon has
+nothing and cannot forge a row (`K10d`–`K10e`).
+
+### Privileges
+
+| object | anon | authenticated | service_role |
+|---|---|---|---|
+| `kyc_levels` | — | SELECT (all rows) | SELECT, INSERT, UPDATE |
+| `kyc_submissions` | — | SELECT own (`user_id = auth.uid()`) | SELECT, INSERT, UPDATE |
+| `kyc_status` | — | SELECT own | SELECT, INSERT, UPDATE |
+| `security_audit_log` | — | SELECT own | SELECT, INSERT (never UPDATE) |
+| functions | — | `my_kyc_status()` only | every entry point |
+
+No `DELETE` anywhere, and every new function has `REVOKE ALL … FROM PUBLIC, anon, authenticated`
+followed by an explicit `GRANT EXECUTE … TO service_role` — the same ACL block pattern as the
+withdrawal migration, run last so every signature exists when it resolves (`K11`).
+
+### Flagged decisions (owner)
+
+1. **Per-tier limits** — withdrawal/deposit/trading caps per KYC level: not modelled at all.
+2. **KYC vendor** (open decision #1): the whole layer stays provider-agnostic until it is chosen;
+   `provider` columns are NULL.
+3. **AML / sanctions / PEP screening** — out of scope; provider-dependent and needs a policy.
+4. **Document storage location** — TBD with the vendor; only opaque references are stored here.
+5. Whether **review is mandatory** for every submission, and who may approve (quorum, SLA) — the
+   state machine allows straight-through approval; the admin/operator workflow is step 9.
+6. **Level downgrade / expiry / re-verification** — not implemented (a downgrade needs a policy
+   for open orders and locked funds). The trigger refuses downgrades rather than allowing them.
+7. **Gating money paths on KYC** — nothing is gated; `kyc_required_for_trading` stays `false`.
+
+### Verification status
+
+`tests/exchange_kyc_tests.sql` runs last in the shared scratch core database:
+**160/160 PASS, 0 FAIL, 0 psql ERRORs** (`tests/run_scratch_suites.sh`, runner exit 0), covering
+the tier model, tier-0 materialisation, both decision paths, the state machine, the level
+invariants, the no-PII guard, the adapter contract (including replay refusal), path separation in
+both directions, the append-only audit log, the authz matrix and the function ACLs. The five
+pre-existing suites stayed green in the same run (matching 63/63, schema 112/0, ledger 5/0 with
+exactly 4 expected ERRORs, immutability+RLS 60/60, deposits 173/173, withdrawals 181/181).
+**Nothing here has been applied to the live Supabase project.**
