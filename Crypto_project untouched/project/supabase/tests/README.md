@@ -95,3 +95,40 @@ exits non-zero if any suite is not green, and keeps raw logs in `$LOGDIR` (defau
 - The book/market views (`v_order_book_best`, `v_order_book_depth`, `v_markets`) are readable only with
   a privileged token — `SELECT` is not granted to `anon`/`authenticated`. Client roles get
   `permission denied for view`, which is what the probe asserts.
+
+### exchange_admin_tests.sql (A0–A15, 171 assertions)
+
+Run LAST in the core database: it needs the fixture users and the registered deposit/withdrawal
+networks the earlier suites create.
+
+- Operator identity on all three paths (explicit id, `gtvx.operator_id` GUC, JWT →
+  `admin_users.auth_user_id`), including the refusals: unknown id, deactivated operator, a JWT
+  that maps to no operator, a JWT operator naming somebody else, and a customer trying to spoof
+  the GUC.
+- The 4×11 permission matrix cell by cell, plus end-to-end denials on real functions for each
+  role (support cannot decide KYC, compliance cannot change markets or maintenance, readonly can
+  read the audit trail but write nothing).
+- Restrictions enforced in all three scopes, in BOTH directions (restrict → refused, clear →
+  works), and the proof that cancelling an order still works while trading is restricted.
+- Maintenance mode ON blocks trading/deposits/withdrawals with distinct messages, and the suite
+  re-reads `app_settings` against a snapshot taken before it ran and asserts they are identical.
+- Role-scoped views: a non-operator and anon get nothing; support sees users but no email;
+  compliance sees email but not the roster; readonly sees the audit trail; superadmin sees all.
+- KYC wrappers write audit rows with a real actor, and the PR #6 state machine is not duplicated.
+- A static probe over `pg_proc.prosrc` proving no admin function can create customer money, plus a
+  post-suite check that every ledger transaction still sums to zero and every balance still equals
+  its entries.
+
+Gotchas specific to this suite:
+
+- `set_config(..., true)` is transaction-local and psql autocommits per statement, so the GUC
+  cannot be set in one statement and read in the next. Use the `a_expect_as(label, username, sql,
+  expected)` helper, which does both inside one function call (one transaction).
+- The four identity helpers must stay `EXECUTE`-granted to `authenticated` or the admin views fail
+  with `permission denied for function operator_can_do`. The A1 ACL assertion checks the
+  privileged functions only, for that reason.
+- `admin_users` has RLS on with **no policy**: `anon` selecting it returns zero rows rather than an
+  error, so assert on the row count, not on an error.
+- A deposit on a network with `required_confirmations = 0` can never be credited (no confirmation
+  policy ⇒ no credit). Use USDT/tron (20) with a 20-confirmation snapshot and ≥ 10 000 0000 base
+  units, its minimum.

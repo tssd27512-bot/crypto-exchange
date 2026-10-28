@@ -461,8 +461,19 @@ select public.d_expect('all twelve service_role entry points exist and are execu
                              'record_deposit','record_provider_deposit','_deposit_ingest','set_deposit_confirmations',
                              'confirm_deposit','set_deposit_under_review','fail_deposit','credit_deposit')
            and has_function_privilege('service_role', p.oid, 'EXECUTE')$q$, '12');
-select public.d_expect('no view exposes deposit data',
-  $q$select count(*)::text from pg_views where schemaname = 'public' and (definition ilike '%deposit%' or viewname ilike '%deposit%')$q$, '0');
+-- 20261005100150 (admin operations) added exactly ONE view that reads the deposits
+-- table: v_admin_deposits, the operator money-path monitor required by the stage-2
+-- control plane. The original guarantee ("no view exposes deposit data") is kept in
+-- the only form that still means something: no view exposes it to a NON-operator.
+-- D5b below proves the view returns nothing to an ordinary caller and is not
+-- readable by anon; the admin suite (A12) proves an operator without money.read
+-- gets nothing either.
+select public.d_expect('the only view over deposit data is the operator-only monitor',
+  $q$select string_agg(viewname, ',' order by viewname) from pg_views
+        where schemaname = 'public' and (definition ilike '%deposit%' or viewname ilike '%deposit%')$q$,
+  'v_admin_deposits');
+select public.d_expect('... and it returns ZERO rows to a caller who is not an operator',
+  $q$select count(*)::text from public.v_admin_deposits$q$, '0');
 select public.d_expect('the deposit tables are not in a publication (no realtime leak)',
   $q$select count(*)::text from pg_publication_tables where schemaname = 'public' and tablename in ('deposits','deposit_addresses','deposit_networks')$q$, '0');
 
