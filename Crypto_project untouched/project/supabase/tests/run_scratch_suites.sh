@@ -58,6 +58,11 @@ psql_ "-q -d $DB_CORE -f '$P/tests/exchange_withdrawal_tests.sql'" > "$LOGDIR/wi
 # purpose (security_audit_log and terminal KYC rows are append-only), so it refuses to run
 # twice in the same database.
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_kyc_tests.sql'" > "$LOGDIR/kyc.log" 2>&1
+# admin / operator control plane (stage 2, part 1): needs the fixture users and the
+# deposit/withdrawal networks the suites above register, and must run LAST in the core
+# database. It flips maintenance_mode in BOTH directions and reverts it, and leaves its
+# own audit rows behind on purpose (security_audit_log is append-only).
+psql_ "-q -d $DB_CORE -f '$P/tests/exchange_admin_tests.sql'" > "$LOGDIR/admin.log" 2>&1
 apply "$DB_MATCH"
 psql_ "-q -d $DB_MATCH -f '$P/tests/exchange_matching_engine_tests.sql'" > "$LOGDIR/matching.log" 2>&1
 
@@ -76,9 +81,11 @@ report immutability_rls "$LOGDIR/immutability_rls.log" 0
 report deposits          "$LOGDIR/deposits.log"          0
 report withdrawals       "$LOGDIR/withdrawals.log"       0
 report kyc               "$LOGDIR/kyc.log"               0
+report admin             "$LOGDIR/admin.log"             0
 grep -E 'SUMMARY' "$LOGDIR/matching.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/deposits.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/withdrawals.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/kyc.log" | grep -q 'fail=0' || rc=1
+grep -E 'SUMMARY' "$LOGDIR/admin.log" | grep -q 'fail=0' || rc=1
 echo "logs in $LOGDIR ; exit status $rc"
 exit $rc

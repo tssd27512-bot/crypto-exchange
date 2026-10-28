@@ -740,3 +740,179 @@ both directions, the append-only audit log, the authz matrix and the function AC
 pre-existing suites stayed green in the same run (matching 63/63, schema 112/0, ledger 5/0 with
 exactly 4 expected ERRORs, immutability+RLS 60/60, deposits 173/173, withdrawals 181/181).
 **Nothing here has been applied to the live Supabase project.**
+
+## Admin / operator control plane (step 9, part 1 — migration `20261005100150_exchange_admin_operations`)
+
+DB layer only: no edge function, no frontend, nothing deployed.
+
+### Operator identity — how a production request says WHO it is
+
+Operators are rows in the existing `admin_users` table (the table the admin-chat edge function
+already logs in against), extended with `operator_role`, `auth_user_id`, `is_active`,
+`display_name`, `updated_at`. `username`/`password_hash` are untouched, so `verify_password` /
+`update_admin_password` keep working.
+
+`resolve_operator(p_operator_id)` is the single place identity is decided. Two paths:
+
+1. **JWT caller** (`auth.uid()` is not null — a browser holding a GoTrue session): the operator is
+   looked up by `admin_users.auth_user_id = auth.uid()`. A caller can only ever be themselves: the
+   explicit `p_operator_id` is refused unless it is their own row, and a JWT that maps to no
+   operator row is refused. The edge function does nothing special here — it forwards the caller's
+   JWT and the server-side call carries no operator id.
+2. **service_role caller** (`auth.uid()` is null — an edge function holding the service key): the
+   explicit `p_operator_id` argument, else the transaction-local GUC `gtvx.operator_id` that the
+   edge function sets after it has verified the admin session. `set_config('gtvx.operator_id', …)`
+   is only honoured on this path, so a signed-in customer cannot spoof it with a `set_config` of
+   their own.
+
+The edge function that verifies an admin login and then calls these RPCs with the service key is
+**not** part of this step. When it is written it must call `set_config('gtvx.operator_id', <id>,
+true)` (or pass `p_operator_id`) after its own session check. The parked
+`feat/admin-auth-hardening` branch (signed admin tokens, rate limiting) should feed path 2 and
+needs no change here.
+
+`assert_operator(action, p_operator_id)` is the guard every admin function starts with: resolve,
+check the matrix, refuse a deactivated operator, then stamp `gtvx.actor_role = 'operator'` and
+`gtvx.actor_id`, so the audit rows written inside the call (including the PR #6 KYC triggers)
+carry a real actor id. **This closes the NULL-actor gap PR #6 left open**: rows written by the old
+operator path before this migration still have `actor_id IS NULL`; every row this migration writes
+has one, and `log_operator_action()` refuses to write a row when no actor can be resolved rather
+than recording NULL.
+
+### Roles and the permission matrix (data, not code)
+
+- `operator_roles`: `superadmin` (4) · `compliance` (3) · `support` (2) · `readonly` (1), with rank
+  and description. Rank is reference metadata for UI ordering; **authorisation is the matrix, never
+  the rank**.
+- `operator_permissions`: 44 rows (4 roles × 11 actions) with an explicit `allowed` per cell —
+  no missing cell is possible, and `operator_can()` denies by default (unknown role, unknown action,
+  no row).
+- Actions: `users.read`, `users.read.pii`, `kyc.read`, `kyc.decide`, `money.read`,
+  `restrictions.write`, `risk.write`, `markets.write`, `settings.write`, `operators.write`,
+  `security.read`.
+
+| action | superadmin | compliance | support | readonly |
+|---|---|---|---|---|
+| users.read | ✓ | ✓ | ✓ | ✓ |
+| users.read.pii | ✓ | ✓ | — | — |
+| kyc.read | ✓ | ✓ | ✓ | ✓ |
+| kyc.decide | ✓ | ✓ | — | — |
+| money.read | ✓ | ✓ | ✓ | ✓ |
+| restrictions.write | ✓ | ✓ | — | — |
+| risk.write | ✓ | ✓ | — | — |
+| markets.write | ✓ | — | — | — |
+| settings.write | ✓ | — | — | — |
+| operators.write | ✓ | — | — | — |
+| security.read | ✓ | ✓ | — | ✓ |
+
+`users.read.pii` gates the email column in `v_admin_users` (and the email in
+`admin_list_users`): the whole column comes back NULL without it.
+
+**Least privilege on upgrade:** `admin_users.operator_role` defaults to `readonly`, so the
+pre-existing `admin` row becomes a read-only operator until the owner promotes it explicitly. The
+migration raises a NOTICE saying so.
+
+### Sensitive-action audit
+
+Every admin function writes one `security_audit_log` row (`action`, `entity_type`, `entity_id`,
+`subject_user_id`, `details.before` / `details.after`) through `log_operator_action()`.
+Actions: `admin.restriction.set|cleared`, `admin.risk_flag.added|resolved`,
+`admin.kyc.under_review|approved|rejected`, `admin.user.inspected`, `admin.users.listed`,
+`admin.security_events.listed`, `admin.market.upserted|fees_changed|status_changed`,
+`admin.deposit_network.upserted`, `admin.withdrawal_network.upserted`,
+`admin.settings.maintenance_changed`, `admin.operator.role_changed|active_changed`.
+
+The high-volume `v_admin_*` views are **not** audited per row (that would flood the log with one
+row per page view); the RPC reads that replace them for list/inspect work are. **Owner decision
+worth a look:** whether a per-view audit is needed.
+
+### Account restrictions and risk flags
+
+- `account_restrictions(user_id, scope, reason, set_at, set_by, cleared_at, cleared_by,
+  cleared_reason)`, `scope ∈ {trading, deposits, withdrawals}`, one ACTIVE row per user+scope
+  (partial unique index), rows are never deleted, clearing sets `active = false` and is audited.
+- `risk_flags(user_id, flag_type, severity low|medium|high|critical, note, created_by,
+  resolved_at/by/note)` — **advisory only**: a flag blocks nothing, by design.
+
+**Enforcement is in the money paths**, via `assert_account_not_restricted(user, scope)` added to
+the five entry points this migration re-creates verbatim (`place_order`, `_deposit_ingest`,
+`credit_deposit`, `_withdrawal_ingest`, `approve_withdrawal`). Refusal is
+`insufficient_privilege` with a message naming the scope, the reason and the restriction id.
+
+Deliberately **not** gated: `cancel_order`, `close_order`, `release_order_remainder`,
+`reject_withdrawal`, `fail_withdrawal`. A restriction must never trap a customer's funds — they
+can always cancel and get their hold back, and the operator can always reject/fail a withdrawal.
+The tests assert the cancel case explicitly.
+
+### Maintenance mode
+
+`app_settings` gains `maintenance_mode` (NOT NULL DEFAULT false), `maintenance_note`,
+`maintenance_set_at`, `maintenance_set_by`. `admin_set_maintenance(on, note)` is the only writer
+(needs a note when switching ON, and it touches only the maintenance columns — mode and every
+LIVE_* flag are left alone). While ON, `assert_not_in_maintenance(area)` inside the same five entry
+points refuses trading / deposits / withdrawals with a distinct message
+(`... is in maintenance mode: deposits is temporarily unavailable`). Cancels and withdrawal
+rejections stay available for the same reason as above.
+
+### KYC review (reuses PR #6, does not duplicate it)
+
+`admin_kyc_set_under_review` / `admin_kyc_approve` / `admin_kyc_reject` require `kyc.decide`, call
+the PR #6 functions (`set_kyc_under_review`, `approve_kyc`, `reject_kyc`) and stamp the actor so
+the existing triggers record a real operator. No state machine is reimplemented — a static test
+asserts the wrappers never `UPDATE kyc_submissions` / `kyc_status` themselves.
+
+### Read surface (role-scoped)
+
+Views: `v_admin_users` (email gated on `users.read.pii`), `v_admin_balances`,
+`v_admin_open_orders`, `v_admin_deposits`, `v_admin_withdrawals`, `v_admin_trades`,
+`v_admin_kyc_queue`, `v_admin_restrictions`, `v_admin_risk_flags`, `v_admin_security_events`,
+`v_admin_operators`. Each filters through `operator_can_do(...)`, so a caller who is not an
+operator (or lacks the action) gets **zero rows**, never an error and never data. `SELECT` is
+granted to `authenticated`, revoked from `anon`; the four read-only identity helpers
+(`current_operator_id`, `current_operator_role`, `operator_can`, `operator_can_do`) are the only
+`EXECUTE` grants to `authenticated`, because PostgreSQL checks function privileges against the
+invoking role for a view.
+
+Paginated RPCs: `admin_list_users(limit, offset, search)`, `admin_list_security_events(...)`,
+`admin_user_overview(user_id)` (JSON: user, kyc_status, kyc_submissions, balances, open_orders,
+restrictions, risk_flags). Indexes `*_admin_created_idx` / `*_admin_status_idx` back the
+newest-first pages.
+
+### Administrators can never create customer money
+
+No function in this migration inserts a `balances` row, touches `accounts`, posts a ledger entry or
+calls `post_entry` / `settle_fill` / `ensure_user_account` / `system_account_id`. A static probe
+over `pg_proc.prosrc` asserts this, and the suite re-checks that every ledger transaction still sums
+to zero and every balance still equals its entries afterwards. Configuration (fees, market status,
+networks) is writable by superadmin; **money is not**, ever, through this surface.
+
+### ACL summary
+
+- New tables (`operator_roles`, `operator_permissions`, `account_restrictions`, `risk_flags`):
+  RLS on with no policy, `REVOKE ALL` from `anon`/`authenticated`, `SELECT/INSERT/UPDATE` to
+  `service_role`.
+- All 18 `admin_*` functions plus the guards: `REVOKE ALL` from PUBLIC/anon/authenticated,
+  `EXECUTE` to `service_role` only. The ACL block runs last in the migration so every signature
+  resolves, and it re-asserts the grants on the five replaced money-path functions.
+
+### Deliberate scope limits (for the owner)
+
+- No edge function, no admin UI: this is the DB layer plus the operator-identity contract the edge
+  function must implement.
+- No operator MFA, no per-IP rate limiting, no operator-session revocation — that is the parked
+  auth-hardening branch.
+- AML/sanctions/PEP screening still out of scope; `risk_flags` is a manual, advisory record only.
+- No money path is gated on KYC, and per-tier limits remain an owner decision.
+- Only `admin_users`, `app_settings`, the five money-path entry points and the deposit-suite
+  assertion noted below were touched; nothing else in the existing engine changed.
+- **One existing test was narrowed** (`exchange_deposit_tests.sql`, "no view exposes deposit
+  data"): the operator monitor `v_admin_deposits` is now the one view over that table, so the
+  assertion became "the only such view is the operator-only monitor, and it returns zero rows to a
+  non-operator". Both halves are asserted.
+
+### Verification
+
+Scratch PostgreSQL 16, migrations applied in order, all suites green (runner exit 0):
+matching 63/63 · schema 112/0 · ledger 5/0 with exactly 4 expected errors · immutability+RLS 3/0 ·
+deposits 174/174 · withdrawals 181/181 · kyc 160/160 · **admin 171/171**. Nothing applied to the
+live project.
