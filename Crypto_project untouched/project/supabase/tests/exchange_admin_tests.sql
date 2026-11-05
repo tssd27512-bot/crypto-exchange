@@ -188,30 +188,34 @@ select public.a_expect('A1 the four operator roles exist, ranked',
   $q$select string_agg(code, ',' order by rank desc) from public.operator_roles$q$,
   'superadmin,compliance,support,readonly');
 
-select public.a_expect('A1 the permission matrix is data: 4 roles x 11 actions = 44 cells',
-  $q$select count(*)::text from public.operator_permissions$q$, '44');
+select public.a_expect('A1 the permission matrix is data: 4 roles x 16 actions = 64 cells',
+  $q$select count(*)::text from public.operator_permissions$q$, '64');
 
 select public.a_expect('A1 every role has an explicit ALLOW or DENY for every action (no missing cell)',
   $q$select count(*)::text from public.operator_roles r cross join (select distinct action from public.operator_permissions) a
         left join public.operator_permissions p on p.role_code = r.code and p.action = a.action
         where p.allowed is null$q$, '0');
 
-select public.a_expect('A1 superadmin is allowed all eleven actions',
-  $q$select count(*)::text from public.operator_permissions where role_code='superadmin' and allowed$q$, '11');
+select public.a_expect('A1 superadmin is allowed all sixteen actions',
+  $q$select count(*)::text from public.operator_permissions where role_code='superadmin' and allowed$q$, '16');
 
 select public.a_expect('A1 compliance may decide KYC but may not touch configuration or the roster',
   $q$select string_agg(action, ',' order by action) from public.operator_permissions
         where role_code='compliance' and allowed$q$,
-  'kyc.decide,kyc.read,money.read,restrictions.write,risk.write,security.read,users.read,users.read.pii');
+  'kyc.decide,kyc.read,money.read,notifications.send,restrictions.write,risk.write,security.read,support.read,support.write,users.read,users.read.pii');
 
-select public.a_expect('A1 support is read-only (nothing writable at all)',
-  $q$select count(*)::text from public.operator_permissions where role_code='support' and allowed
-        and action not in ('users.read','kyc.read','money.read')$q$, '0');
+-- stage 2 part 2 widened support from strictly read-only to "read + answer customers":
+-- support may reply in a support conversation and send a single-user notification, and
+-- nothing else (no broadcast, no announcement, no decision, no configuration).
+select public.a_expect('A1 support writes are exactly support.write + notifications.send',
+  $q$select string_agg(action, ',' order by action) from public.operator_permissions
+        where role_code='support' and allowed$q$,
+  'kyc.read,money.read,notifications.send,support.read,support.write,users.read');
 
 select public.a_expect('A1 readonly reads everything (incl. the audit trail) and writes nothing',
   $q$select string_agg(action, ',' order by action) from public.operator_permissions
         where role_code='readonly' and allowed$q$,
-  'kyc.read,money.read,security.read,users.read');
+  'kyc.read,money.read,security.read,support.read,users.read');
 
 select public.a_expect('A1 an unknown role or action is denied by default',
   $q$select (public.operator_can('nobody','users.read'))::text || '/' ||
@@ -247,9 +251,10 @@ select public.a_expect('A1 every admin function is executable by service_role (t
         where n.nspname='public' and (p.proname like 'admin!_%' escape '!')
           and not has_function_privilege('service_role', p.oid, 'EXECUTE')$q$, '0');
 
-select public.a_expect('A1 the admin surface is 18 functions', 
+-- 18 from stage 2 part 1 + 8 added by stage 2 part 2 (support/comms)
+select public.a_expect('A1 the admin surface is 26 functions',
   $q$select count(*)::text from pg_proc p join pg_namespace n on n.oid=p.pronamespace
-        where n.nspname='public' and p.proname like 'admin!_%' escape '!'$q$, '18');
+        where n.nspname='public' and p.proname like 'admin!_%' escape '!'$q$, '26');
 
 select public.a_expect('A1 the four new tables are service_role-only and have RLS on with no client policy',
   $q$select string_agg(c.relname || ':' || c.relrowsecurity::text || ':' ||
