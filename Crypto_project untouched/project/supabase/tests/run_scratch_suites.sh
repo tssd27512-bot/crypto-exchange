@@ -63,6 +63,11 @@ psql_ "-q -d $DB_CORE -f '$P/tests/exchange_kyc_tests.sql'" > "$LOGDIR/kyc.log" 
 # database. It flips maintenance_mode in BOTH directions and reverts it, and leaves its
 # own audit rows behind on purpose (security_audit_log is append-only).
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_admin_tests.sql'" > "$LOGDIR/admin.log" 2>&1
+# admin support + communications + status views (stage 2, part 2): runs after the admin
+# suite (it reuses its operator control plane, fixture users and markets), places real
+# orders through place_order and creates a market of its own. Additive, refuses nothing,
+# leaves its notifications/announcements/chat rows behind on purpose.
+psql_ "-q -d $DB_CORE -f '$P/tests/exchange_admin_comms_tests.sql'" > "$LOGDIR/comms.log" 2>&1
 apply "$DB_MATCH"
 psql_ "-q -d $DB_MATCH -f '$P/tests/exchange_matching_engine_tests.sql'" > "$LOGDIR/matching.log" 2>&1
 
@@ -82,10 +87,12 @@ report deposits          "$LOGDIR/deposits.log"          0
 report withdrawals       "$LOGDIR/withdrawals.log"       0
 report kyc               "$LOGDIR/kyc.log"               0
 report admin             "$LOGDIR/admin.log"             0
+report comms             "$LOGDIR/comms.log"             0
 grep -E 'SUMMARY' "$LOGDIR/matching.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/deposits.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/withdrawals.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/kyc.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/admin.log" | grep -q 'fail=0' || rc=1
+grep -E 'SUMMARY' "$LOGDIR/comms.log" | grep -q 'fail=0' || rc=1
 echo "logs in $LOGDIR ; exit status $rc"
 exit $rc

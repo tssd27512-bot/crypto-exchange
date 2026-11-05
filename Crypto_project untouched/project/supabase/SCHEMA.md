@@ -916,3 +916,158 @@ Scratch PostgreSQL 16, migrations applied in order, all suites green (runner exi
 matching 63/63 · schema 112/0 · ledger 5/0 with exactly 4 expected errors · immutability+RLS 3/0 ·
 deposits 174/174 · withdrawals 181/181 · kyc 160/160 · **admin 171/171**. Nothing applied to the
 live project.
+
+## Admin support, communications and status views (stage 2, part 2 — migration `20261005100160_exchange_admin_comms`)
+
+DB layer only: no edge function, no frontend, nothing deployed, no money path re-created.
+Every write goes through the stage-2 part-1 guard `assert_operator(action)` and ends in
+`log_operator_action(...)`, so the actor is a real operator on every row (JWT callers through
+`admin_users.auth_user_id`, service_role callers through `p_operator_id` / `gtvx.operator_id` —
+identical to PR #7, no second identity mechanism).
+
+### Support management over the EXISTING chat tables
+
+`admin_list_support_conversations(status, limit, offset)`, `admin_get_support_conversation(id)`,
+`admin_support_reply(conversation_id, content)`, `admin_support_set_status(conversation_id, open|closed)`.
+
+They read and write `chat_conversations` / `chat_messages` — the tables the original live-chat
+migration created for the visitor widget and the `admin-chat` edge function. Actions are audited as
+`admin.support.conversations_listed`, `admin.support.conversation_read`,
+`admin.support.replied`, `admin.support.status_changed`.
+
+- A reply is a `chat_messages` row with `sender = 'agent'`, so the visitor sees it through the
+  existing widget; a closed conversation refuses a reply until it is reopened.
+- Only additive indexes are added to the two chat tables. **No column, constraint, grant or policy
+  on them is touched.**
+
+**PARKED OWNER DECISION (flagged, not fixed):** `chat_conversations` and `chat_messages` are still
+world-readable and world-writable by `anon` and `authenticated` (3 + 2 policies, `USING (true)`).
+That is the original design, it is a live privacy hole (any visitor can read every conversation),
+and closing it changes the visitor widget's contract — so this migration leaves it exactly as it is
+and the tests assert it is *unchanged* (policy counts 3/2, anon still reads the thread). It needs an
+owner decision plus a widget change; it is not something to slip into a DB-only PR.
+
+### Notifications
+
+`notifications(id, user_id, type, title, body, read_at, created_at, created_by)` — `user_id IS NULL`
+means a broadcast visible to every signed-in user.
+
+- `admin_send_notification(user, type, title, body)` — `notifications.send` (superadmin,
+  compliance, support) → `admin.notification.sent`.
+- `admin_broadcast_notification(type, title, body)` — `notifications.broadcast` (superadmin only)
+  → `admin.notification.broadcast`, one row with `user_id NULL`.
+- RLS: a signed-in user `SELECT`s their own rows **or** broadcasts (`user_id = auth.uid() OR
+  user_id IS NULL`); INSERT/UPDATE/DELETE are revoked from `authenticated` and no policy grants
+  them, so there is no client write path.
+- `user_mark_notification_read(id)` (the only function in this migration granted to `authenticated`)
+  marks **the caller's own** row read, idempotently. It refuses another user's row and it refuses a
+  broadcast row: per-user read state for a broadcast needs a per-user receipt table, and marking the
+  shared row read would lie for every other customer. That receipt table is stage 3.
+- Nothing is seeded, generated or faked. An empty table is the honest state.
+
+### Announcements
+
+`announcements(id, title, body, active_from, active_to, created_by NOT NULL, active, created_at,
+deactivated_at, deactivated_by)`.
+
+- `admin_create_announcement(title, body, active_from, active_to)` and
+  `admin_deactivate_announcement(id)` — `announcements.write` (superadmin only), audited as
+  `admin.announcement.created` / `admin.announcement.deactivated`. Deactivation sets
+  `active = false` and keeps the row; nothing is ever deleted.
+- Public read path `v_public_announcements` (SELECT for `anon` and `authenticated`): only rows with
+  `active AND active_from <= now() AND (active_to IS NULL OR active_to > now())`. Zero rows when no
+  announcement exists — the view never returns a placeholder.
+- The table itself is RLS-on with no policy and is not readable by `anon`/`authenticated`.
+
+### `v_admin_custody` — custody / wallet status (money.read)
+
+One row per SYSTEM account (`PAPER_FAUCET`, `FEE_INCOME`, `EXTERNAL_DEPOSIT`,
+`WITHDRAWAL_CLEARING`, …) per asset and environment: `available_units`, `locked_units`,
+`balance_units`, the **`ledger_units` sum over `ledger_entries`**, `entry_count`, and `connectivity`.
+
+`connectivity` is the constant `'not_connected'` on every row. **There is no live chain connectivity
+in this build**; the view must never imply otherwise, and the suite asserts the value on every row.
+Stage 7 (real custody adapters) is the only thing allowed to change it. `balance_units = ledger_units`
+on every row is asserted too — this view is the reconciliation-ready input for stage 4.
+
+### `v_admin_liquidity` — liquidity / market-maker monitoring (money.read)
+
+Per market, aggregated from the real book (`v_order_book_depth`): `open_order_count`,
+`bid_level_count` / `ask_level_count`, `best_bid_units` / `best_ask_units` (and sizes),
+`spread_units` (ask − bid, NULL unless both sides exist), depth inside the **top 5 price levels**
+and full depth per side.
+
+**Honest empty state:** a market with no resting orders shows `open_order_count = 0`, NULL best
+bid/ask, NULL spread and 0 depth — asserted on a freshly created market before any order exists.
+No depth, size or maker is ever fabricated; there is no market maker in this build and the view does
+not imply one. The suite also re-derives every aggregate from the raw `orders` table and requires
+agreement on every market.
+
+### `v_admin_alerts` — risk / security alerts (security.read)
+
+A UNION of three real sources per user: active `account_restrictions` (severity `high`),
+unresolved `risk_flags` (their own severity) and `security_audit_log` actions from the last 7 days
+that name a subject user (`kyc.*`, `security.*`, `withdrawal.*`, `admin.restriction.*`,
+`admin.risk_flag.*`; severity `high` for a failing/rejected action, else `medium`).
+
+**It is a queryable view, not an alerting engine.** Nothing pushes, pages, retries or de-duplicates,
+and no notification row is generated from it. Real-time alerting is stage 3. `support` gets zero rows
+(`security.read` denied); superadmin, compliance and readonly see it.
+
+### Permission matrix additions (data, not code)
+
+Five new actions, 20 new cells — every role still has an explicit ALLOW/DENY for every action:
+
+| action | superadmin | compliance | support | readonly |
+|---|---|---|---|---|
+| support.read | ✓ | ✓ | ✓ | ✓ |
+| support.write | ✓ | ✓ | ✓ | — |
+| notifications.send | ✓ | ✓ | ✓ | — |
+| notifications.broadcast | ✓ | — | — | — |
+| announcements.write | ✓ | — | — | — |
+
+`v_admin_custody` / `v_admin_liquidity` reuse the existing `money.read` cell and `v_admin_alerts`
+reuses `security.read`, so no action was invented for a read that already had one. `support` is no
+longer strictly read-only: it may answer a customer and send a single-user notification, and nothing
+else.
+
+**This re-bases six assertions in `exchange_admin_tests.sql`** (matrix cell count 44 → 64,
+superadmin's allowed count 11 → 16, the compliance/support/readonly allowed-action lists, and the
+`admin_*` function count 18 → 26). Same assertions, updated to the new data — none of them was
+weakened or removed.
+
+### ACL summary
+
+- New tables (`notifications`, `announcements`): RLS on. `notifications` has exactly one policy
+  (SELECT, own-or-broadcast) and `SELECT` granted to `authenticated` with INSERT/UPDATE/DELETE
+  revoked; `announcements` has no policy and no client grant. Both `REVOKE ALL` from PUBLIC/anon,
+  `SELECT, INSERT, UPDATE` to `service_role`.
+- New views: `v_public_announcements` SELECT for `anon`/`authenticated`/`service_role`;
+  `v_admin_custody`, `v_admin_liquidity`, `v_admin_alerts` SELECT for `authenticated` and
+  `service_role`, `REVOKE ALL` from `anon`.
+- The eight new `admin_*` functions: `REVOKE ALL` from PUBLIC/anon/authenticated, `EXECUTE` to
+  `service_role` only. `user_mark_notification_read` is the single exception: `REVOKE ALL` from
+  PUBLIC/anon, `EXECUTE` to `authenticated` and `service_role`. (The PUBLIC revoke matters — a new
+  PostgreSQL function is executable by PUBLIC, and `anon` inherits it.)
+- The four read-only identity helpers keep their `EXECUTE` grant to `authenticated`, re-asserted here
+  because the three new role-scoped views depend on them.
+
+### Deliberate scope limits (for the owner)
+
+- No real-time delivery (websockets/realtime channels), no email/SMS/push provider: a notification is
+  a row, and the frontend/realtime stage is what will surface it.
+- No per-user broadcast read receipts (needs a join table — stage 3).
+- No live custody connectivity: `connectivity = 'not_connected'` is the truth, not a placeholder to
+  be "fixed" in the UI.
+- No market maker and no fabricated depth.
+- No alerting engine, no paging, no escalation policy.
+- User-side chat RLS is untouched — the parked privacy decision above.
+- No money-path function is re-created and no admin function can create customer money (static probe
+  over `pg_proc.prosrc`, plus the post-suite ledger/balance reconciliation checks).
+
+### Verification
+
+Scratch PostgreSQL 16, every migration applied in order, all **nine** suites green (runner exit 0):
+matching 63/63 · schema 112/0 · ledger 5/0 with exactly 4 expected errors · immutability+RLS 60/60 ·
+deposits 174/174 · withdrawals 181/181 · kyc 160/160 · admin 171/171 · **comms 125/125**.
+Nothing was applied to the live project `ctrazoqbudsfkpawpomv`.

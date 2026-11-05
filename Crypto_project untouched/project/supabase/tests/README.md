@@ -65,7 +65,9 @@ sudo ./tests/run_scratch_suites.sh "/path/to/Crypto_project untouched/project/su
 
 Creates two scratch databases, applies the stub + every migration to each, then runs
 `exchange_schema_tests.sql` -> `exchange_ledger_invariant_tests.sql` ->
-`exchange_immutability_rls_probe.sql` in the first database and
+`exchange_immutability_rls_probe.sql` -> `exchange_deposit_tests.sql` ->
+`exchange_withdrawal_tests.sql` -> `exchange_kyc_tests.sql` -> `exchange_admin_tests.sql` ->
+`exchange_admin_comms_tests.sql` in the first database and
 `exchange_matching_engine_tests.sql` alone in the second. It prints one summary line per suite,
 exits non-zero if any suite is not green, and keeps raw logs in `$LOGDIR` (default `/tmp/pr3-logs`).
 
@@ -76,6 +78,8 @@ exits non-zero if any suite is not green, and keeps raw logs in `$LOGDIR` (defau
 | `exchange_immutability_rls_probe.sql` | `NOTICE:  PASS` 56, `NOTICE:  FAIL` 0 — ledger immutability as postgres/authenticated/anon plus the full RLS matrix |
 | `exchange_matching_engine_tests.sql` | `SUMMARY total=63 pass=63 fail=0` |
 | `exchange_kyc_tests.sql` | `SUMMARY total=160 pass=160 fail=0` — the tier model, tier-0 materialisation, both decision paths, the provider-adapter contract, the no-PII guard, the append-only audit log, the authz matrix and the function ACLs |
+| `exchange_admin_tests.sql` | `SUMMARY total=171 pass=171 fail=0` — operator identity on all three paths, the permission matrix, restrictions enforced in the money paths, maintenance mode (flipped and reverted), role-scoped views |
+| `exchange_admin_comms_tests.sql` | `SUMMARY total=125 pass=125 fail=0` — support management over the existing chat tables, notification RPCs + RLS, announcement windows and the public feed, `v_admin_custody` (connectivity `not_connected`, ledger == balance), `v_admin_liquidity` (honest empty state, real aggregates), `v_admin_alerts`, and the ACL / no-money-creation probes |
 
 ## Suite dependencies and gotchas (learned the hard way)
 
@@ -132,3 +136,31 @@ Gotchas specific to this suite:
 - A deposit on a network with `required_confirmations = 0` can never be credited (no confirmation
   policy ⇒ no credit). Use USDT/tron (20) with a 20-confirmation snapshot and ≥ 10 000 0000 base
   units, its minimum.
+
+### exchange_admin_comms_tests.sql (C0–C11, 125 assertions)
+
+Run LAST in the core database: it reuses the operator control plane, fixture users, markets and
+ledger history every earlier suite created, and adds its own synthetic users, operators, a visitor
+conversation, real orders and a market of its own.
+
+- **Reads through an operator-scoped view must run as an operator.** `v_admin_custody`,
+  `v_admin_liquidity` and `v_admin_alerts` filter on `operator_can_do(...)`, and `postgres` (the
+  psql superuser these suites run as) is not an operator — a plain `c_expect` on those views returns
+  zero rows and silently "passes" an empty assertion. Use `c_expect_as(<operator>, ...)` for every
+  assertion that must SEE rows, and a plain `c_expect` only for the zero-row / non-operator cases.
+- **The GUC helper (`c_expect_as`) and the client-role helper (`c_expect` with `p_role`) are not
+  interchangeable.** The first exercises the service_role path (`gtvx.operator_id`), the second the
+  anon/authenticated RLS path.
+- **A subquery inside a client-role assertion runs as that client role**, so RLS hides the row it is
+  looking for. `C5` therefore records the notification ids into `public.c_ids` first and references
+  them from there; without that, "cannot mark somebody else's notification read" fails with
+  `a notification id is required` instead of the real refusal.
+- **New functions are executable by PUBLIC by default**, and `anon` inherits it — revoking from
+  `anon` alone is not enough. `user_mark_notification_read` is revoked from PUBLIC and re-granted to
+  `authenticated` only; C10 asserts both directions.
+- `admin_upsert_market` takes `smallint`/`numeric` parameters: integer literals make the call
+  resolve to a non-existent signature (`admin_upsert_market(unknown, ...) does not exist`). Cast them.
+- `ETH/BTC` is created by the suite as an empty market to prove the honest empty state; the resting
+  buy/sell it then places are real `place_order` calls with `qty 1e15` and `price 100e8` (quote
+  amount 0.1 BTC at `notional_scale = price_scale + base_decimals - quote_decimals = 18`).
+- `EXTERNAL_DEPOSIT` / `WITHDRAWAL_CLEARING` exist once per asset, so count CODES, not rows.
