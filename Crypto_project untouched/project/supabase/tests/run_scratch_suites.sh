@@ -68,6 +68,13 @@ psql_ "-q -d $DB_CORE -f '$P/tests/exchange_admin_tests.sql'" > "$LOGDIR/admin.l
 # orders through place_order and creates a market of its own. Additive, refuses nothing,
 # leaves its notifications/announcements/chat rows behind on purpose.
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_admin_comms_tests.sql'" > "$LOGDIR/comms.log" 2>&1
+# realtime publication + operational health checks (stage 3): runs LAST in the core
+# database. It reuses the fixture users, the paper networks the deposit/withdrawal
+# suites registered and the operator control plane, then adds its own paper deposit
+# and withdrawal request and drives REAL state-machine transitions to prove the
+# status-notification triggers. Realtime DELIVERY is not testable on scratch (no
+# Realtime daemon, wal_level is replica): that stays a deployment-time check.
+psql_ "-q -d $DB_CORE -f '$P/tests/exchange_realtime_health_tests.sql'" > "$LOGDIR/realtime_health.log" 2>&1
 apply "$DB_MATCH"
 psql_ "-q -d $DB_MATCH -f '$P/tests/exchange_matching_engine_tests.sql'" > "$LOGDIR/matching.log" 2>&1
 
@@ -88,11 +95,13 @@ report withdrawals       "$LOGDIR/withdrawals.log"       0
 report kyc               "$LOGDIR/kyc.log"               0
 report admin             "$LOGDIR/admin.log"             0
 report comms             "$LOGDIR/comms.log"             0
+report realtime_health   "$LOGDIR/realtime_health.log"   0
 grep -E 'SUMMARY' "$LOGDIR/matching.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/deposits.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/withdrawals.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/kyc.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/admin.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/comms.log" | grep -q 'fail=0' || rc=1
+grep -E 'SUMMARY' "$LOGDIR/realtime_health.log" | grep -q 'fail=0' || rc=1
 echo "logs in $LOGDIR ; exit status $rc"
 exit $rc

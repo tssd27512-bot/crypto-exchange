@@ -1071,3 +1071,108 @@ Scratch PostgreSQL 16, every migration applied in order, all **nine** suites gre
 matching 63/63 · schema 112/0 · ledger 5/0 with exactly 4 expected errors · immutability+RLS 60/60 ·
 deposits 174/174 · withdrawals 181/181 · kyc 160/160 · admin 171/171 · **comms 125/125**.
 Nothing was applied to the live project `ctrazoqbudsfkpawpomv`.
+
+## Realtime publication + operational health checks (stage 3 — migration `20261005100170_exchange_realtime_health`)
+
+### Realtime publication membership
+
+Eight user-facing event tables are members of `supabase_realtime`: `orders`, `trades`, `balances`,
+`deposits`, `withdrawal_requests`, `notifications`, `chat_conversations`, `chat_messages`. There is
+**no new authorisation mechanism**: Supabase Realtime applies each table's existing RLS to every
+subscriber's row changes, so a subscriber only receives events for rows their RLS already lets them
+read. The migration therefore **refuses to run** if any member of the publication (not just the eight)
+has RLS disabled — an unpublished-RLS table would broadcast every row change to every subscriber.
+
+| channel | what arrives | who sees it |
+|---|---|---|
+| `orders` | INSERT/UPDATE of an order | its owner only (`user_id = auth.uid()`) |
+| `trades` | one INSERT per fill | the taker and the maker of that fill |
+| `balances` | UPDATE when available/locked units change | the account owner |
+| `deposits` | status transitions | the depositor |
+| `withdrawal_requests` | status transitions | the requester |
+| `notifications` | INSERT of own rows + broadcasts (`user_id IS NULL`) | own rows for everyone; broadcasts to all signed-in users |
+| `chat_conversations` / `chat_messages` | support chat created/updated, new message | the visitor widget path (user-side chat RLS unchanged — parked owner decision) |
+
+`security_audit_log` is **deliberately NOT published**: it is operator-only and names subjects,
+actors and IPs. Admin risk/security alerts stay pull-based on `v_admin_alerts`. Publishing the audit
+trail is an owner decision.
+
+**Delivery is not verified here.** A scratch PostgreSQL has no Realtime daemon and runs
+`wal_level = replica`; the stub's `wal_level is insufficient to publish logical changes` warning is
+expected and skipped. Membership is a schema fact on scratch; end-to-end websocket delivery can only
+be verified against the deployed project (production-verification bucket). `system_health.realtime`
+therefore stays `not_configured` — it is never flipped to `ok` from a scratch run.
+
+### Deposit / withdrawal status notifications
+
+Two `AFTER UPDATE OF status` triggers — `deposits_notify_status` and
+`withdrawal_requests_notify_status` — insert exactly **one** `notifications` row per real transition
+(`OLD.status IS DISTINCT FROM NEW.status`), of type `deposit.status` / `withdrawal.status`, carrying
+only facts already on the row (amount rendered with the asset's `base_decimals`, asset symbol, network,
+new status, txid). They fire only on transitions the existing state machines already allow, never
+write money, never retry, never invent an event, and never call a money-path function. Each is
+wrapped so a notification failure raises a WARNING instead of blocking or rolling back the status
+change that caused it.
+
+### `system_health`
+
+`system_health(component PK, status, last_checked_at, detail jsonb, checked_by)`; `status` is CHECKed
+to exactly `ok | degraded | down | not_configured | not_connected`. Seeded once
+(`INSERT … ON CONFLICT DO NOTHING`, so a re-run never rewrites history) with the truth of this build:
+
+| component | seeded status | why |
+|---|---|---|
+| `database` | `ok` — the result of `run_db_self_check()` actually executed at seed time | the self-check counts ledger transactions that do not sum to zero and balances that do not equal their ledger sum |
+| `market_data` | `not_configured` | no market-data provider chosen (owner decision #3) |
+| `blockchain:BTC`, `blockchain:ETH`, `blockchain:USDT`, `blockchain:SOL` | `not_connected` | no live chain connectivity exists; the adapter contracts are interfaces only |
+| `custodian` | `not_connected` | no custody provider chosen (owner decision #2) |
+| `realtime` | `not_configured` | publication recorded, delivery unverified until deployment |
+
+- `record_health(component, status, detail, checked_by)` — the **only write path**, `service_role`
+  only. Enum-checked, refuses an unknown component (adding a component is an ops/owner decision, not
+  a provider's), and stores `detail` **verbatim** (no merge, no sanitising, no "correction"). It is
+  what future edge functions and provider adapters call.
+- `run_db_self_check()` — the real check (counts, never a constant). It reports discrepancies; it
+  never repairs them (that is stage 4's job).
+- `v_system_health` (authenticated) — `component, status, last_checked_at` only. The `detail` JSON is
+  internal evidence and is not a column of this view.
+- `v_admin_system_health` (operator, `security.read`) — adds `checked_by`, the full `detail` and
+  `needs_attention` (true for `down`/`degraded`). **That flag is the failure-alert surface**: nothing
+  pages, retries or fabricates a recovery.
+- `admin_health_recheck(operator)` — `security.read`, audited `admin.health.recheck`. Runs **only** the
+  database self-check and rewrites **only** the `database` row. No overrides: it cannot mark a
+  provider healthy, cannot clear a `down` component, and cannot touch `market_data`, `blockchain:*`,
+  `custodian` or `realtime`.
+- No new permission action is invented: the operator health view and the re-check reuse the existing
+  `security.read` cell (the same one `v_admin_alerts` uses), so the PR #7 matrix and its cell counts
+  are unchanged.
+
+### ACL summary
+
+- `system_health`: RLS on with **no policy** (like `admin_users`), `REVOKE ALL` from PUBLIC/anon/
+  authenticated, `SELECT, INSERT, UPDATE` to `service_role`. The two views are the only read paths.
+- `v_system_health`, `v_admin_system_health`: `SELECT` to `authenticated` and `service_role`,
+  `REVOKE ALL` from `anon`.
+- `record_health`, `run_db_self_check`, `health_status_from_self_check`, `admin_health_recheck`,
+  `units_to_display` and both trigger functions: `REVOKE ALL` from PUBLIC/anon/authenticated,
+  `EXECUTE` to `service_role` only. (The PUBLIC revoke matters — a new PostgreSQL function is
+  executable by PUBLIC and `anon` inherits it.)
+
+### Deliberate scope limits (for the owner)
+
+- No Realtime daemon/channel configuration and no websocket client code: the migration records
+  publication membership; the frontend subscription layer is stage 6.
+- No `security_audit_log` publication (leak) — owner decision if it is ever wanted.
+- No alerting engine: `down`/`degraded` rows are visible in `v_admin_system_health`, nothing pages.
+- No per-user read state for broadcast notifications (unchanged from stage 2, part 2).
+- No provider adapter writes `record_health` yet — stage 7 wires them; until then `market_data`,
+  `blockchain:*`, `custodian` and `realtime` keep their honest non-ok states.
+
+### Verification
+
+Scratch PostgreSQL 16, every migration applied in order, all **ten** suites green (runner exit 0):
+matching 63/63 · schema 112/0 · ledger 5/0 with exactly 4 expected errors · immutability+RLS 60/60 ·
+deposits 174/174 · withdrawals 181/181 · kyc 160/160 · admin 171/171 · comms 125/125 ·
+**realtime_health 106/106**. Live websocket delivery is NOT verified (no Realtime daemon on scratch);
+that stays a deployment-time check. Nothing was applied to the live project
+`ctrazoqbudsfkpawpomv`.

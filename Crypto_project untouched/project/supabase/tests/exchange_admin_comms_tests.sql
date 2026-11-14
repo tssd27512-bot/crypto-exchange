@@ -387,12 +387,16 @@ select public.c_expect_error_as('C4 a notification without a title is refused', 
 -- ===========================================================================
 \echo '=== C5. notifications: user-side RLS, no client write path, mark-read'
 -- ===========================================================================
+-- Re-based by stage 3: deposit/withdrawal status changes now write their own
+-- notifications (types deposit.status / withdrawal.status) from earlier suites, so the
+-- ids this suite maps are only its OWN notification types.
 select public.c_run('C5 record the notification ids for the cross-user checks',
   $q$insert into public.c_ids (name, id)
      select case when user_id is null then 'n_broadcast'
                  when user_id = '99999999-9999-9999-9999-999999990001' then 'n_u1'
                  else 'n_u2' end, id
-       from public.notifications$q$);
+       from public.notifications
+      where type not in ('deposit.status','withdrawal.status')$q$);
 
 select public.c_expect('C5 user 1 sees exactly their own notification + the broadcast',
   $q$select count(*)::text from public.notifications$q$, '2',
@@ -800,8 +804,12 @@ select public.c_expect('C11 every operator audit row this suite wrote names an e
           and (a.actor_id is null or not exists (select 1 from public.admin_users u where u.id = a.actor_id))$q$,
   '0');
 
+-- Re-based by stage 3: the two status-notification types come from real deposit /
+-- withdrawal state transitions in earlier suites (never from this migration), so the
+-- "nothing was seeded" intent is asserted over the types this suite is about.
 select public.c_expect('C11 no notification, announcement or alert was seeded by the migration itself',
-  $q$select (select count(*) from public.notifications)::text || '/'
+  $q$select (select count(*) from public.notifications
+              where type not in ('deposit.status','withdrawal.status'))::text || '/'
         || (select count(*) from public.announcements)::text$q$, '3/3');
 
 \echo '=== SUMMARY'
