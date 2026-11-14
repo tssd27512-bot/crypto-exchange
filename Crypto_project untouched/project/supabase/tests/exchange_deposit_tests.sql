@@ -474,8 +474,16 @@ select public.d_expect('the only view over deposit data is the operator-only mon
   'v_admin_deposits');
 select public.d_expect('... and it returns ZERO rows to a caller who is not an operator',
   $q$select count(*)::text from public.v_admin_deposits$q$, '0');
-select public.d_expect('the deposit tables are not in a publication (no realtime leak)',
-  $q$select count(*)::text from pg_publication_tables where schemaname = 'public' and tablename in ('deposits','deposit_addresses','deposit_networks')$q$, '0');
+-- Re-based by stage 3 (20261005100170): `deposits` IS a realtime publication member now,
+-- which is safe ONLY because RLS protects every row. The leak guard that matters is kept
+-- and strengthened: deposit ADDRESSES and NETWORKS stay unpublished, and the published
+-- table must have RLS enabled (the stage-3 migration refuses to run otherwise).
+select public.d_expect('deposits is published for realtime only because RLS protects it (addresses/networks stay unpublished)',
+  $q$select (select count(*) from pg_publication_tables where schemaname = 'public' and tablename in ('deposit_addresses','deposit_networks'))::text
+        || '/' || (select count(*) from pg_publication_tables where schemaname = 'public' and tablename = 'deposits')::text
+        || '/' || (select c.relrowsecurity from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                    where n.nspname = 'public' and c.relname = 'deposits')::text$q$,
+  '0/1/true');
 
 \echo '=== D6. LIVE_DEPOSITS_ENABLED gate + paper/real path separation (flipped in THIS database only)'
 select public.d_run('paper path: an operator records a paper deposit while deposits_enabled = false',

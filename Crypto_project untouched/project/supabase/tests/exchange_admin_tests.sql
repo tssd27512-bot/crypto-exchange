@@ -252,9 +252,10 @@ select public.a_expect('A1 every admin function is executable by service_role (t
           and not has_function_privilege('service_role', p.oid, 'EXECUTE')$q$, '0');
 
 -- 18 from stage 2 part 1 + 8 added by stage 2 part 2 (support/comms)
-select public.a_expect('A1 the admin surface is 26 functions',
+-- + 1 added by stage 3 (admin_health_recheck, the DB-only operator health re-check)
+select public.a_expect('A1 the admin surface is 27 functions',
   $q$select count(*)::text from pg_proc p join pg_namespace n on n.oid=p.pronamespace
-        where n.nspname='public' and p.proname like 'admin!_%' escape '!'$q$, '26');
+        where n.nspname='public' and p.proname like 'admin!_%' escape '!'$q$, '27');
 
 select public.a_expect('A1 the four new tables are service_role-only and have RLS on with no client policy',
   $q$select string_agg(c.relname || ':' || c.relrowsecurity::text || ':' ||
