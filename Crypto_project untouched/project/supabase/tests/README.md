@@ -81,6 +81,8 @@ exits non-zero if any suite is not green, and keeps raw logs in `$LOGDIR` (defau
 | `exchange_admin_tests.sql` | `SUMMARY total=171 pass=171 fail=0` — operator identity on all three paths, the permission matrix, restrictions enforced in the money paths, maintenance mode (flipped and reverted), role-scoped views |
 | `exchange_admin_comms_tests.sql` | `SUMMARY total=125 pass=125 fail=0` — support management over the existing chat tables, notification RPCs + RLS, announcement windows and the public feed, `v_admin_custody` (connectivity `not_connected`, ledger == balance), `v_admin_liquidity` (honest empty state, real aggregates), `v_admin_alerts`, and the ACL / no-money-creation probes |
 
+| `exchange_reconciliation_tests.sql` | `SUMMARY total=… pass=… fail=0` plus exactly 2 `psql … ERROR` lines (deferred triggers refusing internal drift — the pass condition). Covers provider intake honesty (table starts empty), unavailable≠zero, the four-number comparison, provider/stale/internal drift detection with no auto-correction, run idempotency, the authz + audit + acknowledge flow, and the idempotency re-proofs. |
+
 ## Suite dependencies and gotchas (learned the hard way)
 
 - `exchange_ledger_invariant_tests.sql` and `exchange_immutability_rls_probe.sql` **must run in the

@@ -75,6 +75,13 @@ psql_ "-q -d $DB_CORE -f '$P/tests/exchange_admin_comms_tests.sql'" > "$LOGDIR/c
 # status-notification triggers. Realtime DELIVERY is not testable on scratch (no
 # Realtime daemon, wal_level is replica): that stays a deployment-time check.
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_realtime_health_tests.sql'" > "$LOGDIR/realtime_health.log" 2>&1
+# financial reconciliation + discrepancy alerts (stage 4): runs LAST in the core
+# database. It reuses the fixture users, the registered paper networks, a credited
+# deposit and a settled withdrawal from the suites above, and it drives two
+# expected psql ERROR lines (deferred constraint triggers refusing internal drift,
+# see the suite header). It leaves its own runs/alerts/provider rows behind on
+# purpose: runs, alerts and the provider log are append-only.
+psql_ "-q -d $DB_CORE -f '$P/tests/exchange_reconciliation_tests.sql'" > "$LOGDIR/reconciliation.log" 2>&1
 apply "$DB_MATCH"
 psql_ "-q -d $DB_MATCH -f '$P/tests/exchange_matching_engine_tests.sql'" > "$LOGDIR/matching.log" 2>&1
 
@@ -96,6 +103,24 @@ report kyc               "$LOGDIR/kyc.log"               0
 report admin             "$LOGDIR/admin.log"             0
 report comms             "$LOGDIR/comms.log"             0
 report realtime_health   "$LOGDIR/realtime_health.log"   0
+report reconciliation    "$LOGDIR/reconciliation.log"     2
+# The reconciliation suite deliberately drives exactly TWO bare psql ERROR lines, both
+# named in its header: R6 (a1) an UPDATE to a cached balance with no ledger entries is
+# refused by the deferred constraint trigger ('balance drift on account'), and R6 (a2)
+# an unbalanced ledger transaction is refused ('not a valid double-entry posting').
+# Counting ERROR lines alone is not enough - a syntax error or a missing object would
+# also count as "expected". So the two lines must be those two refusals and nothing else.
+n_err=$(grep -cE '^psql:.*ERROR' "$LOGDIR/reconciliation.log" 2>/dev/null || true)
+n_drift=$(grep -c 'balance drift on account' "$LOGDIR/reconciliation.log" 2>/dev/null || true)
+n_unbal=$(grep -c 'not a valid double-entry posting' "$LOGDIR/reconciliation.log" 2>/dev/null || true)
+n_bad=$(grep -cE '^psql:.*ERROR:  (syntax error|.*does not exist)' "$LOGDIR/reconciliation.log" 2>/dev/null || true)
+if [ "$n_err" = "2" ] && [ "$n_drift" = "1" ] && [ "$n_unbal" = "1" ] && [ "$n_bad" = "0" ]; then
+  echo "reconciliation   expected-ERROR gate: R6 (a1) drift refusal + R6 (a2) unbalanced-posting refusal, 2/2 matched"
+else
+  echo "reconciliation   expected-ERROR gate FAILED: errors=$n_err drift=$n_drift unbalanced=$n_unbal syntax/undefined=$n_bad"
+  grep -E '^psql:.*ERROR' "$LOGDIR/reconciliation.log" 2>/dev/null || true
+  rc=1
+fi
 grep -E 'SUMMARY' "$LOGDIR/matching.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/deposits.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/withdrawals.log" | grep -q 'fail=0' || rc=1
@@ -103,5 +128,6 @@ grep -E 'SUMMARY' "$LOGDIR/kyc.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/admin.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/comms.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/realtime_health.log" | grep -q 'fail=0' || rc=1
+grep -E 'SUMMARY' "$LOGDIR/reconciliation.log" | grep -q 'fail=0' || rc=1
 echo "logs in $LOGDIR ; exit status $rc"
 exit $rc

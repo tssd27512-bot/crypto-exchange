@@ -1176,3 +1176,73 @@ deposits 174/174 · withdrawals 181/181 · kyc 160/160 · admin 171/171 · comms
 **realtime_health 106/106**. Live websocket delivery is NOT verified (no Realtime daemon on scratch);
 that stays a deployment-time check. Nothing was applied to the live project
 `ctrazoqbudsfkpawpomv`.
+
+---
+
+## Stage 4 — financial reconciliation + discrepancy alerts (`20261005100180_exchange_reconciliation.sql`)
+
+**Core rule: reconciliation DETECTS and REPORTS. It never corrects, never auto-adjusts, never
+hides.** No function here writes a ledger entry, moves a cached balance or edits a provider
+figure. A real correction is a deliberate compensating ledger posting by an operator — the
+future path, deliberately not built.
+
+| object | what it is |
+|---|---|
+| `provider_balances` | What a custody/provider adapter reports, EXACTLY as reported: one row per (asset, network, environment), integer base units, `reported_at`, `source`, `detail`. **EMPTY until a real provider exists**; a missing row means *unavailable*, never zero. A reported `0` is a real empty-wallet report and is kept distinct from a missing row. |
+| `provider_balances_log` | Append-only history of every report (`recorded` / `replaced` + `previous_units`), written by an AFTER trigger, UPDATE/DELETE refused. |
+| `reconciliation_runs` | One row per run: `started_at`, `finished_at`, `status` (running/completed/failed), `environment`, `triggered_by`, `detail` (per-check invariants + counts). Write-once: only status/finished_at/detail change, and only while `running`. A run that raises is recorded `failed` with the error in `detail` — callers must check `status`. |
+| `reconciliation_results` | Per (asset, environment): `customer_liability_units` (ledger, source of truth), `projection_units` (cached balances), `custody_units`, `provider_units` (NULL = unavailable), `drift_units` = liability − projection, `status` (match/drift/unavailable), `detail`. Append-only. |
+| `reconciliation_alerts` | `severity` warning/critical, `kind` internal_drift/custody_mismatch/provider_mismatch/stale_provider, `detail`, `acknowledged_at/by/note`. Append-only; UPDATE only for the three acknowledge columns, once; DELETE refused. Acknowledge ≠ fix. |
+| `record_provider_balance(...)` | The ONLY write path into provider data (the stage-7 adapter hook). Stores exactly what is reported; refuses fractional (never rounds), negative, NULL, unknown asset, missing source, non-object detail, unknown environment. `service_role` only. |
+| `run_reconciliation(environment, operator)` | Operator path (`security.read`, audited with a real actor): one snapshot, all active assets, alerts, invariant scan. `service_role` only at the grant level. |
+| `acknowledge_reconciliation_alert(id, note, operator)` | `risk.write`, audited, write-once. Changes the acknowledge columns and nothing else. |
+| `v_admin_reconciliation` | Latest run per environment × asset with the four numbers, status, detail, open/acknowledged alert counts (`money.read`). A run with no results (failed/running) still shows one row with `asset NULL`, so a failed run is never invisible. |
+| `v_admin_reconciliation_alerts` | Every alert with run, asset, severity, kind, detail, acknowledgement state (`security.read`). |
+
+### The four numbers, and one deviation from the spec (flagged)
+
+`custody_units` is the custody-side mirror, SIGNED: `-(EXTERNAL_DEPOSIT + WITHDRAWAL_CLEARING)`
+ledger sums = net value taken in from outside minus paid out. It is the number a provider report
+is comparable to, so `provider_mismatch` compares `provider_units` with `custody_units`.
+
+The spec expected `custody_units` to equal `customer_liability_units` "by construction". **It does
+not in this schema, and pretending it did would be dishonest:** liability is the user-side sum,
+while `PAPER_FAUCET` (paper funding) and `FEE_INCOME` (fees) are also system accounts, so
+`liability = -(EXTERNAL_DEPOSIT + WITHDRAWAL_CLEARING + PAPER_FAUCET + FEE_INCOME)`. Equality
+holds only for the FULL system mirror. So the "assert it matches by construction" check is done
+where the construction guarantees it — `custody_mismatch` (critical) fires when SUM over ALL
+accounts of an asset/environment is not zero — and the gap is shown, never hidden:
+`detail.custody_breakdown` (per system account code) and `detail.non_custody_system_units`
+(= liability − custody, i.e. paper faucet + fee income).
+
+`status` resolves: internal drift or broken mirror ⇒ `drift`; else no provider report ⇒
+`unavailable`; else provider disagrees ⇒ `drift`; else `match`. Provider mismatch is a WARNING,
+not critical: provider data is untrusted until stage 7 verifies the adapter. A provider report
+older than 24h raises `stale_provider` even when the value agrees.
+
+### Invariant scan (every run, recorded in `detail.invariants`)
+
+1. every ledger transaction sums to zero; 2. every cached balance equals its ledger sum (via the
+PR #3 `v_account_reconciliation` view); 3. every asset total across ALL accounts sums to zero.
+Each check is recorded as `{check, ok, offending, sample_ids}` (ids bounded to 20); a failure
+raises a CRITICAL alert per offending (asset, environment).
+
+### Authorisation — no new permission cell
+
+`run_reconciliation` uses the existing `security.read` cell and
+`acknowledge_reconciliation_alert` the existing `risk.write` cell, so the PR #7 matrix is
+unchanged (4 roles × 16 actions = 64 cells) and no earlier suite had to be re-based. Precedent:
+stage 3's `admin_health_recheck` (also an audited operator action that runs a check and writes a
+row) uses `security.read`. The spec allowed either and asked for the choice to be flagged.
+
+All five tables: RLS on with **no policy**, `SELECT` only for `service_role`, nothing for
+`anon`/`authenticated`; the RPCs are the only write path. The two views are owner-run (the
+`v_admin_custody` pattern) and scope on `operator_can_do(...)`.
+
+### Not done (deliberate)
+
+Auto-correction / compensating postings, a scheduler, alert push/dedup/retry, realtime publication
+of reconciliation rows, edge functions, frontend, a real provider adapter (stage 7). Reconciliation
+alerts are **not** folded into `v_admin_alerts`: that view is keyed per customer and these alerts
+are system-wide, so folding them in would need a fabricated user or a shape change to a view the
+comms suite already asserts.
