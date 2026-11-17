@@ -31,11 +31,18 @@
 --       credit, duplicate withdrawal settlement, reserved balances, refund once
 --   R10 the safety gate is untouched and the database is left consistent
 --
--- Two psql ERROR lines are the PASS condition (like the ledger suite's four):
---   (1) R6  UPDATE balances without ledger entries  -> 'balance drift on account'
---   (2) R6  INSERT an unbalanced ledger transaction -> 'not a valid double-entry posting'
--- Both are DEFERED constraint triggers, so they fire at COMMIT and cannot be
--- caught inside a DO block; they are top-level BEGIN ... COMMIT blocks.
+-- EXACTLY TWO bare psql ERROR lines are the PASS condition (like the ledger suite's
+-- four), and they are the only two deliberate ones in this suite:
+--   probe R6 (a1)  UPDATE a cached balance with no ledger entries
+--                  -> refused with 'balance drift on account'
+--   probe R6 (a2)  INSERT an unbalanced ledger transaction
+--                  -> refused with 'not a valid double-entry posting'
+-- Both are DEFERRED constraint triggers, so they fire at COMMIT and cannot be caught
+-- inside a DO block; they are top-level BEGIN ... COMMIT blocks. Everything else that
+-- must be refused is asserted in-process by r_expect_error()/r_expect_error_as(), which
+-- emit a NOTICE and never a bare ERROR line.
+-- The runner checks more than the count: it requires these two messages and rejects any
+-- 'syntax error' / 'does not exist' line, so a broken statement cannot pass as a probe.
 --
 -- Every fixture is synthetic and labelled as such. No balance, trade, deposit,
 -- withdrawal, customer or provider connection is invented; provider_balances
@@ -594,7 +601,7 @@ select public.r_expect('R5 the alert carries both numbers and the difference',
   (select custody_units::text || '/' || provider_units::text || '/1'
      from public.reconciliation_results
     where run_id = (select id from public.reconciliation_runs order by started_at desc limit 1)
-      and asset_id = (select id from public.assets where symbol = 'BTC'));
+      and asset_id = (select id from public.assets where symbol = 'BTC')));
 
 select public.r_expect('R5 NOTHING was corrected: the ledger, the balances and the provider row are untouched',
   $q$select (select count(*) from public.ledger_transactions)::text = public.r_snap_value('r5_before_tx')
