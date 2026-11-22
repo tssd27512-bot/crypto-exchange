@@ -82,6 +82,11 @@ psql_ "-q -d $DB_CORE -f '$P/tests/exchange_realtime_health_tests.sql'" > "$LOGD
 # see the suite header). It leaves its own runs/alerts/provider rows behind on
 # purpose: runs, alerts and the provider log are append-only.
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_reconciliation_tests.sql'" > "$LOGDIR/reconciliation.log" 2>&1
+# paper/live separation audit (stage 5): runs ABSOLUTELY LAST in the core database.
+# It reuses the fixture users, the registered paper networks and markets, then flips
+# app_settings.mode to live and back (the only suite that does), so nothing may run
+# after it. Every refusal is caught in-process: it emits NO bare psql ERROR line.
+psql_ "-q -d $DB_CORE -f '$P/tests/exchange_separation_audit.sql'" > "$LOGDIR/separation_audit.log" 2>&1
 apply "$DB_MATCH"
 psql_ "-q -d $DB_MATCH -f '$P/tests/exchange_matching_engine_tests.sql'" > "$LOGDIR/matching.log" 2>&1
 
@@ -104,6 +109,7 @@ report admin             "$LOGDIR/admin.log"             0
 report comms             "$LOGDIR/comms.log"             0
 report realtime_health   "$LOGDIR/realtime_health.log"   0
 report reconciliation    "$LOGDIR/reconciliation.log"     2
+report separation_audit  "$LOGDIR/separation_audit.log"   0
 # The reconciliation suite deliberately drives exactly TWO bare psql ERROR lines, both
 # named in its header: R6 (a1) an UPDATE to a cached balance with no ledger entries is
 # refused by the deferred constraint trigger ('balance drift on account'), and R6 (a2)
@@ -129,5 +135,6 @@ grep -E 'SUMMARY' "$LOGDIR/admin.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/comms.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/realtime_health.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/reconciliation.log" | grep -q 'fail=0' || rc=1
+grep -E 'SUMMARY' "$LOGDIR/separation_audit.log" | grep -q 'fail=0' || rc=1
 echo "logs in $LOGDIR ; exit status $rc"
 exit $rc

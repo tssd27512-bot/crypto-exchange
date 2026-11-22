@@ -1246,3 +1246,83 @@ of reconciliation rows, edge functions, frontend, a real provider adapter (stage
 alerts are **not** folded into `v_admin_alerts`: that view is keyed per customer and these alerts
 are system-wide, so folding them in would need a fabricated user or a shape change to a view the
 comms suite already asserts.
+
+---
+
+## Stage 5 — paper/live separation matrix (`20261005100190_exchange_paper_live_final.sql`)
+
+Stage 5 was an **audit-and-close-gaps** pass, not a rebuild: the machinery below mostly already
+existed. What changed is three functions (guards only, bodies verbatim) plus the proof that every
+path is gated and refuses the other environment.
+
+### The three gates this stage added
+
+| # | Function | Gap found | Guard added |
+|---|---|---|---|
+| 1 | `assert_trading_enabled()` | required `mode='live'` + `live_trading_enabled` but never read `live_enabled_at`; the table CHECK `app_settings_live_gate_check` made that unreachable, so the engine trusted `mode` alone | live trading now also requires `live_enabled_at IS NOT NULL` (`'live_enabled_at is NULL'`), belt-and-braces on top of the CHECK. Paper trading unchanged (`paper_trading_enabled`). |
+| 2 | `record_provider_balance()` | accepted `p_environment='live'` while the exchange was paper — a real custody figure could be written into a paper-mode database | live reports refused unless `mode='live'` (`'refusing a live report in paper mode'`). Paper reports unchanged. |
+| 3 | `run_reconciliation()` | accepted `p_environment='live'` while paper, creating live runs/results/alerts | live runs refused unless `mode='live'` (`'refusing a live run in paper mode'`). Paper runs unchanged. |
+
+Nothing was weakened, dropped or renamed. `app_settings` is untouched: `mode='paper'`, every
+`LIVE_*` flag false, `paper_*` switches true, `live_enabled_at` NULL.
+
+### The matrix (path → gate → proving test)
+
+`SA` = `tests/exchange_separation_audit.sql` (new, this stage). `M` matching · `S` schema ·
+`D` deposits · `W` withdrawals · `K` KYC · `A` admin · `C` comms · `H` realtime/health ·
+`R` reconciliation.
+
+| Path (public entry point) | Gate(s) — in the order they fire | Proven by |
+|---|---|---|
+| `place_order` | `assert_trading_enabled` (mode + paper/live flag + **live_enabled_at**) → `assert_not_in_maintenance('trading')` → `assert_account_not_restricted('trading')` → market must exist **in the current environment** → `orders`/`ledger_transactions` environment triggers | M; A (restrictions, maintenance); SA S1/S3/S4 |
+| `cancel_order` | `assert_trading_enabled` only. **Deliberate:** cancelling releases funds and must stay available during maintenance/restrictions | M; A; SA S1, S6 |
+| `match_order`, `close_order`, `settle_fill` | internal; `settle_fill` re-asserts `assert_trading_enabled`; every ledger row goes through `post_entry` + the environment trigger | M; SA S6 |
+| `record_deposit` → `_deposit_ingest` | source↔mode pairing (`paper_operator` refused unless `mode='paper'`) → `assert_deposits_enabled` (live: `deposits_enabled`) → `assert_paper_deposits_enabled` (paper path) → `assert_not_in_maintenance('deposits')` → `assert_account_not_restricted` → `deposits` environment trigger | D; A; SA S1/S3/S6 |
+| `record_provider_deposit` → `_deposit_ingest('provider_adapter')` | source↔mode pairing (`provider_adapter` refused unless `mode='live'`) → `assert_deposits_enabled` (`deposits_enabled`) → maintenance → restriction | D; SA S2/S3 |
+| `set_deposit_confirmations`, `confirm_deposit`, `set_deposit_under_review`, `fail_deposit` | `assert_deposits_enabled` (+ deposit status machine) | D; SA S6 |
+| `credit_deposit` | `assert_deposits_enabled` → maintenance → restriction → `assert_paper_deposits_enabled` for a paper row | D; SA S1/S6 |
+| `record_withdrawal_request` → `_withdrawal_ingest` | source↔mode pairing (`paper_operator` refused unless paper) → `assert_withdrawals_enabled` → `assert_paper_withdrawals_enabled` → maintenance → restriction → `withdrawal_requests` environment trigger | W; A; SA S1/S3/S6 |
+| `record_provider_withdrawal` → `_withdrawal_ingest('provider_adapter')` | source↔mode pairing (`provider_adapter` refused unless live) → `assert_withdrawals_enabled` (`withdrawals_enabled`) → maintenance → restriction | W; SA S2/S3 |
+| `approve_withdrawal`, `start_withdrawal_processing`, `set_withdrawal_under_review`, `complete_withdrawal` | `assert_withdrawals_enabled` (+ maintenance/restriction on approve) (+ `assert_paper_withdrawals_enabled` for a paper row on approve/complete) | W; A; SA S1/S6 |
+| `reject_withdrawal`, `fail_withdrawal` (release) | `assert_withdrawals_enabled` only. **Deliberate:** locked funds must always be releasable, so the paper switch is not read | W; SA S6 |
+| `submit_kyc` | `assert_kyc_path('paper_operator')` → refused while `mode='live'` (live intake comes from the provider) | K; SA S1/S3 |
+| `record_provider_kyc_event` | `assert_kyc_path('provider_adapter')` → refused unless `mode='live'` | K; SA S2/S3 |
+| `approve_kyc`, `reject_kyc`, `set_kyc_under_review` (+ `admin_kyc_*` wrappers) | `assert_kyc_path(<submission source>)` — a paper submission cannot be decided in live mode and vice versa; `kyc_submissions_source_environment_check` backs it in the data | K; A; SA S6 |
+| `record_provider_balance` | **NEW** live environment requires `mode='live'`; service_role only; append-only log | R; SA S2/S3/S6 |
+| `run_reconciliation` | **NEW** live environment requires `mode='live'` → `assert_operator('security.read')` | R; SA S1/S2/S3/S6 |
+| `acknowledge_reconciliation_alert` | operator `security.read`; no environment of its own (an alert belongs to a run) | R; SA S6 |
+| table-level gate (`enforce_environment_gate`) | `accounts`, `ledger_transactions`, `orders`, `trades`, `deposits`, `withdrawal_requests`: a `live` row is refused unless `mode='live'` **and** the feature flag is on | S; SA S2/S6 |
+| non-money paths: notifications, announcements, support chat, `system_health` | **no mode gate** — they carry no money and no environment column. Reachability is unchanged by mode: an operator can send a notification or answer support in either mode | C; H; SA S6 (static: no mode gate in their bodies) |
+
+### Deliberately NOT gated (documented, flagged to the owner)
+
+1. **`admin_upsert_market(..., p_environment)`** can create a `live` market row while the exchange is
+   paper. It moves no money and the row is inert: no order, trade, ledger row, deposit or withdrawal
+   can exist in the `live` environment until `mode='live'` (trigger). Gating it was not required by
+   the audit list and would have been an unrequested behaviour change to an admin path.
+2. **Paper rows are allowed in live mode** for `record_provider_balance` and `run_reconciliation`
+   (only the *live* direction is gated). A paper report/run while live reads and writes only paper
+   data and cannot influence a live reconciliation.
+3. **`cancel_order` and the withdrawal release paths** intentionally ignore maintenance mode and
+   account restrictions (see the matrix).
+
+### What still depends on deployment / providers (honest)
+
+- **Realtime delivery** is not verifiable on scratch (no Realtime daemon, `wal_level=replica`); the
+  publication and its RLS gate are proven, delivery is a deployment-time check (stage 3).
+- **Custody connectivity** does not exist: `v_admin_custody` reports `not_connected`, and
+  `provider_balances` is empty until a real adapter calls `record_provider_balance` (stage 7).
+- **Live KYC / live deposits / live withdrawals** have no adapter behind them. In live mode the
+  adapter paths pass the mode gate and then stop at the next honest refusal (unregistered live
+  network, missing provider submission). No live money or customer data exists in any environment.
+- **No `LIVE_*` flag has ever been true outside a scratch database**, and stage 5 does not change
+  what "verified" must mean before one is turned on (owner decision #4).
+
+### Verification (stage 5)
+
+Eleven suites from stages 1–4 plus `exchange_separation_audit.sql` (81 assertions: 81 pass, 0 fail,
+0 bare `psql ERROR`), all green on a scratch PostgreSQL 16 through
+`tests/run_scratch_suites.sh`, which now runs the audit suite last in the core database. The audit
+suite is the only one that flips `app_settings.mode`; it reverts it, asserts the settings are
+identical to its own pre-run snapshot, asserts **zero** live money rows were created, and re-checks
+both ledger invariants. Nothing in this stage was deployed to `ctrazoqbudsfkpawpomv`.
