@@ -1,11 +1,20 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import {
   Sparkles, LayoutDashboard, Wallet, ArrowDownToLine,
   ArrowUpFromLine, LineChart, BarChart3, Gift,
   User, FileCheck, LifeBuoy, HelpCircle,
-  Bell, LogOut, X, Check,
+  Bell, LogOut, X, Check, History as HistoryIcon,
 } from 'lucide-react';
+import { useAuth } from '@/hooks/useAuth';
+import {
+  fetchMyNotifications,
+  markNotificationRead,
+  toApiFailure,
+  useQuery,
+  useRealtimeTable,
+  type NotificationRow,
+} from '@/lib/api';
 
 interface SidebarProps {
   collapsed: boolean;
@@ -20,6 +29,7 @@ const mainMenu = [
   { label: 'Withdraw', icon: ArrowUpFromLine, path: '/withdraw' },
   { label: 'Trade', icon: LineChart, path: '/trade' },
   { label: 'Market Overview', icon: BarChart3, path: '/market-overview' },
+  { label: 'History', icon: HistoryIcon, path: '/history' },
   { label: 'Invite & Earn', icon: Gift, path: '/invite' },
 ];
 
@@ -33,16 +43,48 @@ const helpCenter = [
   { label: 'FAQs', icon: HelpCircle, path: '/faq' },
 ];
 
-const mockNotifications = [
-  { title: 'Welcome to GlobalTradeVX', desc: 'Your demo account is ready to explore.', time: 'Just now', unread: true },
-  { title: 'Markets are live', desc: 'Track 13+ assets in Market Overview.', time: '2 min ago', unread: true },
-  { title: 'Complete your profile', desc: 'Visit Profile Settings to personalize.', time: '1 hour ago', unread: false },
-];
+function relativeTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const diff = Math.max(0, Date.now() - then);
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'Just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+}
 
 export default function DashboardSidebar({ collapsed, mobileOpen, onCloseMobile }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const [notifOpen, setNotifOpen] = useState(false);
+  const { signOut } = useAuth();
+
+  // Real notifications: the `notifications` table is in the supabase_realtime
+  // publication, so a change refetches; if realtime is not delivered (only
+  // verifiable after deployment) the list simply stays as last fetched.
+  const notifications = useQuery<NotificationRow[]>('my-notifications', fetchMyNotifications);
+  useRealtimeTable('notifications', { onChange: notifications.reload });
+  const notificationItems: NotificationRow[] =
+    notifications.state.status === 'ready' ? notifications.state.data : [];
+  const unreadCount = notificationItems.filter((n) => !n.read_at).length;
+
+  const handleMarkRead = async (id: string) => {
+    try {
+      await markNotificationRead(id);
+      notifications.reload();
+    } catch {
+      // A refusal here is the backend's answer (e.g. a broadcast row); the list
+      // keeps showing the true read state rather than pretending it changed.
+    }
+  };
+
+  const handleSignOut = async () => {
+    await signOut();
+    navigate('/sign-in', { replace: true });
+  };
 
   const isActive = (path: string) => location.pathname === path;
 
@@ -94,20 +136,49 @@ export default function DashboardSidebar({ collapsed, mobileOpen, onCloseMobile 
             <div className="absolute bottom-full left-3 right-3 mb-2 rounded-2xl bg-white dark:bg-surface-dark-3 border border-gray-200 dark:border-white/10 shadow-2xl card-glow overflow-hidden">
               <div className="px-4 py-3 border-b border-gray-100 dark:border-white/5 flex items-center justify-between">
                 <span className="text-sm font-semibold text-gray-900 dark:text-white">Notifications</span>
-                <span className="text-xs text-gray-400">2 new</span>
+                <span className="text-xs text-gray-400">
+                  {notifications.state.status === 'ready' ? `${unreadCount} unread` : ''}
+                </span>
               </div>
               <div className="max-h-64 overflow-y-auto scrollbar-hide">
-                {mockNotifications.map((n, i) => (
-                  <div key={i} className="px-4 py-3 hover:bg-gray-50 dark:hover:bg-white/5 border-b border-gray-100 dark:border-white/5 last:border-0">
+                {notifications.state.status === 'loading' && (
+                  <div className="px-4 py-6 text-center text-xs text-gray-400">Loading…</div>
+                )}
+
+                {(notifications.state.status === 'unavailable' ||
+                  notifications.state.status === 'error') && (
+                  <div className="px-4 py-5 text-center">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {notifications.state.status === 'unavailable'
+                        ? 'Notifications are not available yet — the exchange backend has not been deployed to this project.'
+                        : toApiFailure(notifications.state.failure).message}
+                    </p>
+                  </div>
+                )}
+
+                {notifications.state.status === 'ready' && notificationItems.length === 0 && (
+                  <div className="px-4 py-6 text-center text-xs text-gray-400 dark:text-gray-500">
+                    No notifications yet.
+                  </div>
+                )}
+
+                {notificationItems.map((n) => (
+                  <button
+                    key={n.id}
+                    onClick={() => (!n.read_at ? handleMarkRead(n.id) : undefined)}
+                    className="w-full text-left px-4 py-3 hover:bg-gray-50 dark:hover:bg-white/5 border-b border-gray-100 dark:border-white/5 last:border-0"
+                  >
                     <div className="flex items-start gap-2">
-                      {n.unread && <span className="w-2 h-2 rounded-full bg-brand-500 mt-1.5 shrink-0" />}
-                      <div className={n.unread ? '' : 'pl-4'}>
+                      {!n.read_at && <span className="w-2 h-2 rounded-full bg-brand-500 mt-1.5 shrink-0" />}
+                      <div className={!n.read_at ? '' : 'pl-4'}>
                         <p className="text-sm font-medium text-gray-900 dark:text-white">{n.title}</p>
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{n.desc}</p>
-                        <p className="text-xs text-gray-400 dark:text-gray-600 mt-1">{n.time}</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{n.body}</p>
+                        <p className="text-xs text-gray-400 dark:text-gray-600 mt-1">
+                          {relativeTime(n.created_at)}
+                        </p>
                       </div>
                     </div>
-                  </div>
+                  </button>
                 ))}
               </div>
               <button
@@ -115,7 +186,7 @@ export default function DashboardSidebar({ collapsed, mobileOpen, onCloseMobile 
                 className="w-full px-4 py-2.5 text-xs font-medium text-brand-600 dark:text-brand-400 hover:bg-brand-50 dark:hover:bg-brand-950/30 transition-colors border-t border-gray-100 dark:border-white/5 flex items-center justify-center gap-1.5"
               >
                 <Check className="w-3.5 h-3.5" />
-                Mark all as read
+                Close
               </button>
             </div>
           )}
@@ -128,12 +199,14 @@ export default function DashboardSidebar({ collapsed, mobileOpen, onCloseMobile 
           >
             <div className="relative shrink-0">
               <Bell className="w-5 h-5" />
-              <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-brand-500" />
+              {unreadCount > 0 && (
+                <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-brand-500" />
+              )}
             </div>
             {!collapsed && <span>Notifications</span>}
           </button>
           <button
-            onClick={() => navigate('/')}
+            onClick={handleSignOut}
             className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-red-50 dark:hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400 transition-colors ${
               collapsed ? 'justify-center' : ''
             }`}
