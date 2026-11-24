@@ -2,6 +2,7 @@ import { useState, useEffect, ReactNode } from 'react';
 import { Menu, Moon, Sun, ArrowLeft } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useTheme } from '@/hooks/useTheme';
+import { useAuth } from '@/hooks/useAuth';
 import DashboardSidebar from '@/components/dashboard/DashboardSidebar';
 import SupportChat from '@/components/dashboard/SupportChat';
 
@@ -12,6 +13,7 @@ interface DashboardLayoutProps {
 
 export default function DashboardLayout({ title, children }: DashboardLayoutProps) {
   const { theme, toggleTheme } = useTheme();
+  const { displayName, initials, user } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
@@ -55,11 +57,15 @@ export default function DashboardLayout({ title, children }: DashboardLayoutProp
             </button>
             <div className="flex items-center gap-2.5 pl-3 border-l border-gray-200 dark:border-white/10">
               <div className="w-8 h-8 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-xs font-bold text-white">
-                JD
+                {initials}
               </div>
               <div className="hidden sm:block">
-                <div className="text-sm font-medium text-gray-900 dark:text-white">John Doe</div>
-                <div className="text-xs text-gray-500 dark:text-gray-500">Demo Account</div>
+                <div className="text-sm font-medium text-gray-900 dark:text-white">
+                  {displayName || 'Signed in'}
+                </div>
+                <div className="text-xs text-gray-500 dark:text-gray-500">
+                  {user?.email ?? ''}
+                </div>
               </div>
             </div>
           </div>
