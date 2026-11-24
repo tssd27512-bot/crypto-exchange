@@ -1,25 +1,13 @@
-import { statsData } from '@/data/mockData';
-import { useReveal, useCountUp } from '@/hooks/useReveal';
+import { BarChart3 } from 'lucide-react';
+import { useReveal } from '@/hooks/useReveal';
 
-function StatItem({ stat, start }: { stat: typeof statsData[0]; start: boolean }) {
-  const value = useCountUp(stat.value, 2000, start);
-
-  const displayValue = stat.value < 10
-    ? value.toFixed(2)
-    : Math.round(value).toString();
-
-  return (
-    <div className="text-center">
-      <div className="text-3xl sm:text-4xl lg:text-5xl font-bold text-gradient">
-        {stat.prefix}{displayValue}{stat.suffix}
-      </div>
-      <div className="mt-2 text-sm text-gray-500 dark:text-gray-400 font-medium">
-        {stat.label}
-      </div>
-    </div>
-  );
-}
-
+/**
+ * Landing-page statistics band.
+ *
+ * This used to count up hardcoded trading-volume and user figures. Those were
+ * never real, so they are gone: the band now states plainly that no statistics
+ * exist yet. Nothing here is simulated.
+ */
 export default function StatsBar() {
   const { ref, inView } = useReveal();
 
@@ -30,12 +18,19 @@ export default function StatsBar() {
 
       <div
         ref={ref}
-        className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8"
+        className={`relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 reveal ${inView ? 'in-view' : ''}`}
       >
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-8">
-          {statsData.map((stat) => (
-            <StatItem key={stat.label} stat={stat} start={inView} />
-          ))}
+        <div className="flex flex-col items-center text-center">
+          <div className="w-12 h-12 rounded-full bg-white/10 border border-white/15 flex items-center justify-center mb-3">
+            <BarChart3 className="w-6 h-6 text-white/80" />
+          </div>
+          <p className="text-lg sm:text-xl font-semibold text-white">
+            Platform statistics not available yet
+          </p>
+          <p className="mt-2 text-sm text-white/70 max-w-xl">
+            Trading volume, user counts and market data are not shown because the exchange backend
+            is not deployed and a market-data provider is not configured yet.
+          </p>
         </div>
       </div>
     </section>

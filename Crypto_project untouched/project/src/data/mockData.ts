@@ -7,18 +7,6 @@ export interface MarketAsset {
   color: string;
 }
 
-export const marketData: MarketAsset[] = [
-  { symbol: 'BTC', name: 'Bitcoin', price: 67234.50, change24h: 2.34, volume: '$28.4B', color: '#f7931a' },
-  { symbol: 'ETH', name: 'Ethereum', price: 3512.80, change24h: 3.12, volume: '$14.2B', color: '#627eea' },
-  { symbol: 'BNB', name: 'BNB', price: 589.30, change24h: -0.87, volume: '$2.1B', color: '#f3ba2f' },
-  { symbol: 'SOL', name: 'Solana', price: 178.45, change24h: 5.67, volume: '$4.8B', color: '#9945ff' },
-  { symbol: 'XRP', name: 'XRP', price: 0.6234, change24h: 1.45, volume: '$1.9B', color: '#23292f' },
-  { symbol: 'ADA', name: 'Cardano', price: 0.4567, change24h: -2.13, volume: '$890M', color: '#0033ad' },
-  { symbol: 'DOGE', name: 'Dogecoin', price: 0.1342, change24h: 4.23, volume: '$1.2B', color: '#c2a633' },
-  { symbol: 'DOT', name: 'Polkadot', price: 7.89, change24h: 0.92, volume: '$620M', color: '#e6007a' },
-  { symbol: 'AVAX', name: 'Avalanche', price: 42.15, change24h: -1.34, volume: '$780M', color: '#e84142' },
-];
-
 export const dashboardMarketData: MarketAsset[] = [
   { symbol: 'BTC', name: 'Bitcoin', price: 67234.50, change24h: 2.34, volume: '$28.4B', color: '#f7931a' },
   { symbol: 'ETH', name: 'Ethereum', price: 3512.80, change24h: 3.12, volume: '$14.2B', color: '#627eea' },
@@ -33,13 +21,6 @@ export const dashboardMarketData: MarketAsset[] = [
   { symbol: 'LINK', name: 'Chainlink', price: 18.42, change24h: 3.45, volume: '$680M', color: '#2a5ada' },
   { symbol: 'UNI', name: 'Uniswap', price: 9.87, change24h: -0.56, volume: '$320M', color: '#ff007a' },
   { symbol: 'LTC', name: 'Litecoin', price: 84.50, change24h: 1.12, volume: '$540M', color: '#345d9d' },
-];
-
-export const statsData = [
-  { label: 'Daily Volume', value: 8.4, suffix: 'B', prefix: '$' },
-  { label: 'Platform Uptime', value: 99.99, suffix: '%', prefix: '' },
-  { label: 'Registered Users', value: 5.2, suffix: 'M', prefix: '' },
-  { label: 'Countries Served', value: 190, suffix: '+', prefix: '' },
 ];
 
 export const trustCards = [
