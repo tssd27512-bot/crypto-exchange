@@ -1104,6 +1104,11 @@ END $q$;
 -- own requests and applications and can write only through the three wrappers.
 -- The new column and the new statuses need no policy change; the table-level
 -- SELECT grant covers the added column.
+--
+-- The table COMMENT is deliberately NOT replaced: migration 170 (realtime) attached
+-- channel-semantics comments to the published tables and the realtime suite counts
+-- them, so withdrawal_requests keeps its stage-3 comment. The new column and the
+-- new status/source values are documented here instead.
 -- ---------------------------------------------------------------------------
-COMMENT ON TABLE public.withdrawal_requests IS
-  'One row per withdrawal request: the owner''s state machine (pending/under review/approved/processing/completed/failed/rejected/cancelled), the requested amount, the fee snapshot, the destination supplied by the caller, the provider txid and the three ledger transactions that hold, settle or release the money. Written only by _withdrawal_ingest (operator, provider adapter and user_client paths), the operator transitions (service_role) and cancel_my_withdrawal() (the client''s own release of a pending request) — a client role has no INSERT/UPDATE/DELETE privilege at all. Unique (environment, network, provider_txid) and unique (user_id, idempotency_key).';
+COMMENT ON COLUMN public.withdrawal_requests.status IS
+  'pending | under review | approved | processing | completed | failed | rejected | cancelled. approved means the funds are locked (for a user_client row they were locked at request time); completed/failed/rejected/cancelled are terminal and immutable. cancelled is a user cancel of a still-pending request, reachable only through cancel_my_withdrawal().';

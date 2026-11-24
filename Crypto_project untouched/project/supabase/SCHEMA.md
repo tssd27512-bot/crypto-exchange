@@ -1326,3 +1326,104 @@ Eleven suites from stages 1–4 plus `exchange_separation_audit.sql` (81 asserti
 suite is the only one that flips `app_settings.mode`; it reverts it, asserts the settings are
 identical to its own pre-run snapshot, asserts **zero** live money rows were created, and re-checks
 both ledger invariants. Nothing in this stage was deployed to `ctrazoqbudsfkpawpomv`.
+
+---
+
+## Stage 7 — user-facing withdrawal requests and KYC submissions
+
+Migration `20261005100200_exchange_user_submissions.sql` (stage 7, not deployed). Two client
+entry points — `request_withdrawal` and `cancel_my_withdrawal` — plus a KYC application entry
+point `submit_my_kyc`, so a signed-in user can act **without any service_role permission**,
+without a chain/provider call and without any path to a self-granted "verified".
+
+### Public surface (granted to `authenticated` ONLY)
+
+| function | signature | returns | auth | ownership |
+|---|---|---|---|---|
+| `request_withdrawal` | `(p_asset text, p_network text, p_amount_units bigint, p_idempotency_key text DEFAULT NULL, p_destination_address text DEFAULT NULL)` | `TABLE (request_id uuid, request_status text, existing boolean)` | `auth.uid() IS NULL` → `insufficient_privilege` "no authenticated user" | `user_id := auth.uid()`; never a parameter |
+| `cancel_my_withdrawal` | `(p_request_id uuid)` | `TABLE (request_id uuid, request_status text, released_units numeric)` | same | row must satisfy `user_id = auth.uid()` **inside** the function, plus the own-row RLS policy |
+| `submit_my_kyc` | `(p_tier_code text, p_documents jsonb DEFAULT '{}')` | `TABLE (submission_id uuid, submission_status text, existing boolean)` | same | `user_id := auth.uid()` |
+
+ACL: `REVOKE ALL ... FROM PUBLIC, anon, authenticated, service_role` then `GRANT EXECUTE ... TO
+authenticated` on each of the three. **service_role is deliberately not granted** — the operator
+surface stays exactly the functions it already had. The suite asserts the ACL itself
+(`aclexplode`, no `grantee = 0`) rather than only `has_function_privilege`, and asserts that the
+only privileged money functions executable by `authenticated` are the two documented stage-1 ones
+(`place_order`, `cancel_order`).
+
+`submit_my_kyc` is named that way on purpose: `submit_kyc(p_user_id, p_level, ...)` is the
+**operator** path (service_role) and the KYC suite's static ACL probe asserts no function named
+`submit_kyc` is executable by `authenticated`. A second overload under the same name would have
+broken that assertion or forced it to be weakened.
+
+### Grants / ownership / gates matrix
+
+| function | auth | ownership | validation | gates | idempotency |
+|---|---|---|---|---|---|
+| `request_withdrawal` | `auth.uid()` required, anon has no EXECUTE | `user_id = auth.uid()`; own-row RLS on reads | integer base units > 0, network min/max, asset exists, (asset, network) registered + enabled, memo requirement, destination required (4..200, no whitespace) | `assert_withdrawals_enabled`, `assert_paper_withdrawals_enabled`, `assert_not_in_maintenance('withdrawals')`, `assert_account_not_restricted(uid, 'withdrawals')`, paper-only mode rule | `UNIQUE (user_id, idempotency_key)`; hold key `withdrawal_hold:<id>`; retry returns `existing = true` and holds nothing |
+| `cancel_my_withdrawal` | `auth.uid()` required | `user_id = auth.uid()` checked in the function | status must be `pending` | release path: deliberately **not** gated by the paper switch or maintenance (like reject/fail) | release key `withdrawal_release:<id>`; a second cancel is refused |
+| `submit_my_kyc` | `auth.uid()` required | `user_id = auth.uid()`; own-row RLS on reads | tier must exist in `kyc_levels` and be ≥ 1; documents must be a JSON object; existing no-PII denylist trigger refuses personal data | `assert_kyc_path('user_client')` — paper only in this stage | one OPEN application per (user, tier) via `kyc_submissions_user_open_key`; retry returns `existing = true` |
+
+### Money rules of a client withdrawal request
+
+* **Request holds.** `request_withdrawal` posts one `withdrawal_request` ledger transaction
+  (`available -= amount+fee`, `locked += amount+fee`) and stores it in
+  `hold_ledger_transaction_id`. An unfunded request raises `insufficient available balance` and
+  rolls back entirely — a request row never exists without its hold.
+* **Idempotent, no double hold.** New column `withdrawal_requests.idempotency_key` +
+  partial `UNIQUE (user_id, idempotency_key)`. The hold uses the same ledger idempotency key the
+  approval path uses (`withdrawal_hold:<request id>`), so a race can only produce one hold; the
+  losing call returns the winner's request with `existing = true`.
+* **Cancel releases exactly.** `cancel_my_withdrawal` → `_withdrawal_close(id, 'cancelled', ...)`
+  → one balanced `withdrawal_refund` (`locked -= amount+fee`, `available += amount+fee`), recorded
+  in `released_ledger_transaction_id`, `closed_at` set. Only from `pending`.
+* **Approval stays admin-only.** `approve_withdrawal` is still service_role only and gained ONE
+  additive branch: if the row already carries its hold (a client request), approval **confirms**
+  it instead of posting a second one; every row without a pre-existing hold (operator path,
+  provider adapter) is byte-identical to before. Approval of a client request therefore moves no
+  money.
+* **New terminal status `cancelled`** (added to `withdrawal_requests_status_check`, the state
+  machine trigger — reachable from `pending` only — and the `closed_at` / `released` /
+  `hold_released` CHECKs). It is terminal and immutable like `failed`/`rejected`.
+* **New source `user_client`** on `withdrawal_requests` and `kyc_submissions`. The existing
+  source↔environment pairing CHECK is untouched, so `user_client` can only ever be a PAPER row.
+
+### KYC honesty
+
+`submit_my_kyc` inserts one row with `status = 'pending'` (the existing state machine's
+"awaiting review" — the plan's "pending_review" is that same state; no new KYC status was
+invented), `source = 'user_client'`, `environment = 'paper'`. It never writes `kyc_status.level`
+(the applicant stays level 0 / unverified) and its body contains no approval path. Only
+`approve_kyc` (operator) or `record_provider_kyc_event` (a real provider event) can decide an
+application, and both are service_role only. The existing audit trigger records the submission
+with `actor_role = 'user'`, `actor_id = auth.uid()`. One open application per user per tier; a
+resubmission after a final state is a new row.
+
+### Stage-7 scope (flagged, not silent)
+
+* Both client write paths are **paper-only in this stage**: while `app_settings.mode = 'live'`
+  they refuse with a distinct message, so a client can never create a live money row or a live
+  KYC application. Live withdrawals enter through `record_provider_withdrawal`, live KYC through
+  `record_provider_kyc_event`. Opening the client paths in live mode is a separate owner-gated
+  change.
+* No new RLS policy was needed: `withdrawal_requests_select_own` (migration 130) and
+  `kyc_submissions_select_own` (migration 140) already restrict a client to its own rows; no
+  write policy exists for any client role, and this migration adds none.
+* The destination address is **not verified** (no allow-list, no chain integration) — the same
+  position as the operator path. No document upload/storage, no vendor, no per-tier limits, no
+  KYC gating of money paths.
+* Frontend unchanged: the Withdraw and KYC pages stay disabled this stage.
+
+### Verification
+
+`tests/exchange_user_submissions.sql` (U0–U11, 130 assertions) runs in the core scratch database
+**after** the reconciliation suite and **before** the separation audit (it flips `mode` to live
+and back and reverts it). It covers: anon refused on all three wrappers; authenticated without a
+JWT claim refused with the distinct error; the hold and its exact amounts; idempotency (one row,
+one hold, unchanged ledger sums on retry); every validation refusal with no row recorded; the
+cross-user cancel refusal; the RLS matrix on both tables; the exact cancel release; approval
+admin-only + confirming the pre-existing hold; the operator path still holding exactly as before;
+the mode gates both ways plus the paper switch, maintenance mode and an account restriction; the
+KYC pending-only / no-PII / one-open-per-tier / never-verified rules; the static grant probe; and
+a final re-check that `app_settings` is unchanged, no live row exists, every ledger transaction is
+zero-sum and every balance equals its entries.

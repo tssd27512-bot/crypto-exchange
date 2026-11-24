@@ -82,6 +82,11 @@ psql_ "-q -d $DB_CORE -f '$P/tests/exchange_realtime_health_tests.sql'" > "$LOGD
 # see the suite header). It leaves its own runs/alerts/provider rows behind on
 # purpose: runs, alerts and the provider log are append-only.
 psql_ "-q -d $DB_CORE -f '$P/tests/exchange_reconciliation_tests.sql'" > "$LOGDIR/reconciliation.log" 2>&1
+# user-facing withdrawal requests + KYC submissions (stage 7): runs after the
+# reconciliation suite and BEFORE the separation audit, because it flips
+# app_settings.mode to live and back as well and reverts it. It is additive, emits
+# no bare psql ERROR line, and refuses to run twice in the same database.
+psql_ "-q -d $DB_CORE -f '$P/tests/exchange_user_submissions.sql'" > "$LOGDIR/user_submissions.log" 2>&1
 # paper/live separation audit (stage 5): runs ABSOLUTELY LAST in the core database.
 # It reuses the fixture users, the registered paper networks and markets, then flips
 # app_settings.mode to live and back (the only suite that does), so nothing may run
@@ -109,6 +114,7 @@ report admin             "$LOGDIR/admin.log"             0
 report comms             "$LOGDIR/comms.log"             0
 report realtime_health   "$LOGDIR/realtime_health.log"   0
 report reconciliation    "$LOGDIR/reconciliation.log"     2
+report user_submissions  "$LOGDIR/user_submissions.log"   0
 report separation_audit  "$LOGDIR/separation_audit.log"   0
 # The reconciliation suite deliberately drives exactly TWO bare psql ERROR lines, both
 # named in its header: R6 (a1) an UPDATE to a cached balance with no ledger entries is
@@ -135,6 +141,7 @@ grep -E 'SUMMARY' "$LOGDIR/admin.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/comms.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/realtime_health.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/reconciliation.log" | grep -q 'fail=0' || rc=1
+grep -E 'SUMMARY' "$LOGDIR/user_submissions.log" | grep -q 'fail=0' || rc=1
 grep -E 'SUMMARY' "$LOGDIR/separation_audit.log" | grep -q 'fail=0' || rc=1
 echo "logs in $LOGDIR ; exit status $rc"
 exit $rc
